@@ -91,6 +91,7 @@ extern "C" fn backends() -> RString {
             "recover_stale".to_string(),
         ],
         invoke_prefix: INVOKE_PREFIX.to_string(),
+        ..Default::default()
     };
     RString::from(sj::to_string(&[def]).unwrap_or_else(|_| "[]".to_string()))
 }
@@ -179,6 +180,13 @@ extern "C" fn invoke(name: RStr<'_>, args_json: RStr<'_>) -> RResult<RString, RS
     }
 }
 
+/// Declared SQL tables: none yet (this plugin owns no plugin-scoped tables).
+/// Empty declaration matches what orca synthesizes for a plugin predating the
+/// field; a stateful plugin would return a real SchemaDecl here.
+extern "C" fn schemas() -> RString {
+    RString::from(r#"{"namespace":"","tables":[]}"#)
+}
+
 #[export_root_module]
 fn export() -> PluginModRef {
     PluginMod {
@@ -189,6 +197,7 @@ fn export() -> PluginModRef {
         manifest,
         invoke,
         backends,
+        schemas,
     }
     .leak_into_prefix()
 }
