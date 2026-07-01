@@ -2,6 +2,10 @@
 name = "nfs"
 version = "0.1.0"
 edition = "2021"
+description = "NFS StorageBackend with stale-mount self-heal — backend-only orca plugin"
+
+[package.metadata.orca]
+category = "storage"
 
 [lib]
 name = "nfs"
