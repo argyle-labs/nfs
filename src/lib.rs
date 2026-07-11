@@ -9,12 +9,10 @@ use std::time::Duration;
 
 use plugin_toolkit::async_trait;
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
     Capability, MountOutcome, RecoverOutcome, Share, StorageBackend, StorageError, StorageKind,
 };
-use plugin_toolkit::tokio::process::Command;
-
-mod abi_export;
 
 const PROC_MOUNTS: &str = "/proc/mounts";
 const FSTAB: &str = "/etc/fstab";
@@ -244,7 +242,7 @@ pub async fn remount_one(entry: &FstabEntry) -> Result<(), NfsError> {
                 .arg("reset-failed")
                 .arg(&unit)
                 .arg(unit.replace(".automount", ".mount"))
-                .status()
+                .output()
                 .await;
             drop(reset);
         }
@@ -257,14 +255,14 @@ pub async fn remount_one(entry: &FstabEntry) -> Result<(), NfsError> {
             mountpoint: entry.mountpoint.clone(),
             source,
         })?;
-    if out.status.success() {
+    if out.status.success {
         Ok(())
     } else {
         Err(NfsError::Remount {
             mountpoint: entry.mountpoint.clone(),
             source: std::io::Error::other(format!(
-                "exit {}: {}",
-                out.status,
+                "exit {:?}: {}",
+                out.status.code,
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
         })
@@ -284,7 +282,7 @@ async fn systemd_escape(mountpoint: &str, suffix: &str) -> Result<String, NfsErr
             mountpoint: mountpoint.to_string(),
             source,
         })?;
-    if out.status.success() {
+    if out.status.success {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
         Err(NfsError::Remount {
@@ -327,11 +325,11 @@ pub fn filter_by_fstype(mounts: Vec<Mount>, fstype: &str) -> Vec<Mount> {
 /// only reliable detection signal.
 pub async fn check_health(mountpoint: &str, timeout: Duration) -> String {
     let fut = Command::new("stat").arg("--").arg(mountpoint).output();
-    match plugin_toolkit::tokio::time::timeout(timeout, fut).await {
-        Err(_) => "stale".to_string(),
-        Ok(Err(e)) => format!("error: {e}"),
-        Ok(Ok(out)) if out.status.success() => "ok".to_string(),
-        Ok(Ok(out)) => format!("error: {}", String::from_utf8_lossy(&out.stderr).trim()),
+    match plugin_toolkit::time::timeout(timeout, fut).await {
+        None => "stale".to_string(),
+        Some(Err(e)) => format!("error: {e}"),
+        Some(Ok(out)) if out.status.success => "ok".to_string(),
+        Some(Ok(out)) => format!("error: {}", String::from_utf8_lossy(&out.stderr).trim()),
     }
 }
 
@@ -343,19 +341,13 @@ pub async fn list(
     health_timeout: Duration,
 ) -> Result<Vec<Mount>, NfsError> {
     let mut mounts = filter_by_fstype(filter_watch(read_mounts()?, watch), fstype_filter);
-    let probes: Vec<_> = mounts
-        .iter()
-        .map(|m| {
-            let mp = m.mountpoint.clone();
-            plugin_toolkit::tokio::spawn(async move { check_health(&mp, health_timeout).await })
-        })
-        .collect();
-    for (m, probe) in mounts.iter_mut().zip(probes) {
-        m.health = Some(
-            probe
-                .await
-                .unwrap_or_else(|e| format!("error: probe task failed: {e}")),
-        );
+    let probes = mounts.iter().map(|m| {
+        let mp = m.mountpoint.clone();
+        async move { check_health(&mp, health_timeout).await }
+    });
+    let results = plugin_toolkit::futures_util::future::join_all(probes).await;
+    for (m, health) in mounts.iter_mut().zip(results) {
+        m.health = Some(health);
     }
     Ok(mounts)
 }
@@ -386,31 +378,23 @@ pub async fn release(
         }
     }
     let umount_flag = if force { "-lf" } else { "-l" };
-    let attempts: Vec<_> = targets
-        .into_iter()
-        .map(|mp| {
-            plugin_toolkit::tokio::spawn(async move {
-                let res = Command::new("umount")
-                    .arg(umount_flag)
-                    .arg(&mp)
-                    .status()
-                    .await;
-                (mp, res)
-            })
-        })
-        .collect();
+    let attempts = targets.into_iter().map(|mp| async move {
+        let res = Command::new("umount")
+            .arg(umount_flag)
+            .arg(&mp)
+            .output()
+            .await
+            .map(|o| o.status);
+        (mp, res)
+    });
     let mut released = Vec::new();
     let mut failed = Vec::new();
-    for handle in attempts {
-        let (mp, res) = handle.await.map_err(|e| NfsError::Umount {
-            mountpoint: "<unknown>".to_string(),
-            source: std::io::Error::other(format!("join error: {e}")),
-        })?;
+    for (mp, res) in plugin_toolkit::futures_util::future::join_all(attempts).await {
         match res {
-            Ok(status) if status.success() => released.push(mp),
+            Ok(status) if status.success => released.push(mp),
             Ok(status) => failed.push(ReleaseFailure {
                 mountpoint: mp,
-                error: format!("exit code {status}"),
+                error: format!("exit code {:?}", status.code),
             }),
             Err(e) => failed.push(ReleaseFailure {
                 mountpoint: mp,
@@ -435,13 +419,13 @@ pub async fn mount_all() -> Result<(), NfsError> {
         .output()
         .await
         .map_err(|source| NfsError::MountAll { source })?;
-    if out.status.success() {
+    if out.status.success {
         Ok(())
     } else {
         Err(NfsError::MountAll {
             source: std::io::Error::other(format!(
-                "exit {}: {}",
-                out.status,
+                "exit {:?}: {}",
+                out.status.code,
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
         })
