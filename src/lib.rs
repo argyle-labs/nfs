@@ -345,7 +345,7 @@ pub async fn list(
         let mp = m.mountpoint.clone();
         async move { check_health(&mp, health_timeout).await }
     });
-    let results = plugin_toolkit::futures_util::future::join_all(probes).await;
+    let results = plugin_toolkit::reactor::join_all(probes).await;
     for (m, health) in mounts.iter_mut().zip(results) {
         m.health = Some(health);
     }
@@ -389,7 +389,7 @@ pub async fn release(
     });
     let mut released = Vec::new();
     let mut failed = Vec::new();
-    for (mp, res) in plugin_toolkit::futures_util::future::join_all(attempts).await {
+    for (mp, res) in plugin_toolkit::reactor::join_all(attempts).await {
         match res {
             Ok(status) if status.success => released.push(mp),
             Ok(status) => failed.push(ReleaseFailure {
