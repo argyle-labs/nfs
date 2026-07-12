@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 use std::time::Duration;
 
-use plugin_toolkit::async_trait;
+use plugin_toolkit::orca_async;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
@@ -546,7 +546,7 @@ impl Default for NfsBackend {
     }
 }
 
-#[async_trait::async_trait]
+#[orca_async]
 impl StorageBackend for NfsBackend {
     fn name(&self) -> &str {
         &self.name
