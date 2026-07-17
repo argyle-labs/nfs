@@ -11,7 +11,8 @@ use plugin_toolkit::orca_async;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
-    Capability, MountOutcome, RecoverOutcome, Share, StorageBackend, StorageError, StorageKind,
+    render_option_set, Capability, MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionSet,
+    RecoverOutcome, Share, StorageBackend, StorageError, StorageKind,
 };
 
 const PROC_MOUNTS: &str = "/proc/mounts";
@@ -524,6 +525,189 @@ pub async fn recover_stale(
     Ok(result)
 }
 
+// ── nfs option grammar ──────────────────────────────────────────────────────
+//
+// The nfs backend owns the grammar of its own mount options. `parse_nfs_options`
+// turns the raw comma string a `MountSpec` carries into a typed
+// `OptionSet::Nfs`, rejecting anything malformed or self-contradictory at declare
+// time rather than at mount time. `normalize_nfs_source` canonicalizes the
+// `host:/export` form. `render_option_set` (owned by the storage domain) is the
+// inverse — the two round-trip.
+
+/// NFS protocol versions this backend accepts for `vers=`. Anything else is a
+/// hard rejection: a bad version silently falls back in the kernel, so catching
+/// it here keeps a typo from becoming a wrong-protocol mount.
+const VALID_NFS_VERS: &[&str] = &["3", "4", "4.0", "4.1", "4.2"];
+
+/// Sane transfer-size bounds for `rsize`/`wsize` (bytes). The Linux client clamps
+/// to its own limits, but a value outside [4 KiB, 16 MiB] or not a power-of-two
+/// multiple of the page is almost always a mistake; reject the obviously-wrong
+/// ones rather than let the kernel silently renegotiate.
+const MIN_XSIZE: u32 = 4096;
+const MAX_XSIZE: u32 = 16 * 1024 * 1024;
+
+/// `timeo` is in deciseconds; a value of 0 disables the timeout (a footgun on a
+/// network mount) and anything beyond ~1 hour is nonsensical.
+const MAX_TIMEO_DECISECONDS: u32 = 36_000;
+
+/// Upper bound for `retrans` / `actimeo`; large-but-finite guard against typos
+/// (e.g. a stray extra digit) rather than a protocol limit.
+const MAX_RETRANS: u32 = 100;
+const MAX_ACTIMEO_SECONDS: u32 = 86_400;
+
+/// Normalize an nfs source into canonical `host:/export` form. Accepts the
+/// already-canonical form and trims incidental whitespace; rejects an empty
+/// source or one missing the `:` / export separation.
+fn normalize_nfs_source(source: &str) -> Result<String, StorageError> {
+    let s = source.trim();
+    if s.is_empty() {
+        return Err(StorageError::Other("nfs source is empty".into()));
+    }
+    let (host, export) = s
+        .split_once(':')
+        .ok_or_else(|| StorageError::Other(format!("nfs source `{s}` is not `host:/export`")))?;
+    let host = host.trim();
+    let export = export.trim();
+    if host.is_empty() {
+        return Err(StorageError::Other(format!(
+            "nfs source `{s}` has an empty host"
+        )));
+    }
+    if !export.starts_with('/') {
+        return Err(StorageError::Other(format!(
+            "nfs source `{s}` export path must be absolute (start with `/`)"
+        )));
+    }
+    Ok(format!("{host}:{export}"))
+}
+
+/// Parse a numeric nfs option, tagging the field name in any error.
+fn parse_num(key: &str, value: &str) -> Result<u32, StorageError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| StorageError::Other(format!("nfs option `{key}` is not a number: `{value}`")))
+}
+
+/// Parse a raw comma-separated nfs option string into a typed [`OptionSet::Nfs`],
+/// enforcing the backend's grammar:
+///   * `vers` must be one of [`VALID_NFS_VERS`];
+///   * `hard` and `soft` are mutually exclusive (declaring both is rejected);
+///   * `timeo`/`retrans`/`actimeo`/`rsize`/`wsize` must parse and sit in sane
+///     bounds;
+///   * `_netdev` sets the netdev flag;
+///   * every other `key` / `key=value` token is preserved verbatim in `extra`,
+///     so a legal-but-untyped option (`nconnect=4`, `nofail`, `ro`) rides
+///     through without the backend having to enumerate the whole kernel grammar.
+fn parse_nfs_options(raw: Option<&str>) -> Result<OptionSet, StorageError> {
+    let mut vers = None;
+    let mut hard = None;
+    let mut soft = None;
+    let mut timeo = None;
+    let mut retrans = None;
+    let mut actimeo = None;
+    let mut rsize = None;
+    let mut wsize = None;
+    let mut netdev = false;
+    let mut extra = Vec::new();
+
+    let raw = raw.unwrap_or("");
+    for tok in raw.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let (key, value) = match tok.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim())),
+            None => (tok, None),
+        };
+        match (key, value) {
+            ("vers" | "nfsvers", Some(v)) => {
+                if !VALID_NFS_VERS.contains(&v) {
+                    return Err(StorageError::Other(format!(
+                        "nfs option `vers={v}` is not a supported version (expected one of {VALID_NFS_VERS:?})"
+                    )));
+                }
+                vers = Some(v.to_string());
+            }
+            ("hard", None) => hard = Some(true),
+            ("soft", None) => soft = Some(true),
+            ("timeo", Some(v)) => {
+                let n = parse_num("timeo", v)?;
+                if n == 0 || n > MAX_TIMEO_DECISECONDS {
+                    return Err(StorageError::Other(format!(
+                        "nfs option `timeo={n}` out of range (1..={MAX_TIMEO_DECISECONDS} deciseconds)"
+                    )));
+                }
+                timeo = Some(n);
+            }
+            ("retrans", Some(v)) => {
+                let n = parse_num("retrans", v)?;
+                if n > MAX_RETRANS {
+                    return Err(StorageError::Other(format!(
+                        "nfs option `retrans={n}` out of range (0..={MAX_RETRANS})"
+                    )));
+                }
+                retrans = Some(n);
+            }
+            ("actimeo", Some(v)) => {
+                let n = parse_num("actimeo", v)?;
+                if n > MAX_ACTIMEO_SECONDS {
+                    return Err(StorageError::Other(format!(
+                        "nfs option `actimeo={n}` out of range (0..={MAX_ACTIMEO_SECONDS} seconds)"
+                    )));
+                }
+                actimeo = Some(n);
+            }
+            ("rsize", Some(v)) => rsize = Some(check_xsize("rsize", parse_num("rsize", v)?)?),
+            ("wsize", Some(v)) => wsize = Some(check_xsize("wsize", parse_num("wsize", v)?)?),
+            ("_netdev", None) => netdev = true,
+            // hard/soft/vers with the wrong arity → clear rejection rather than
+            // silently dropping into `extra`.
+            ("hard" | "soft" | "_netdev", Some(_)) => {
+                return Err(StorageError::Other(format!(
+                    "nfs option `{key}` takes no value"
+                )));
+            }
+            ("vers" | "nfsvers" | "timeo" | "retrans" | "actimeo" | "rsize" | "wsize", None) => {
+                return Err(StorageError::Other(format!(
+                    "nfs option `{key}` requires a value"
+                )));
+            }
+            // Legal-but-untyped passthrough (nofail, ro, nconnect=4, …).
+            _ => extra.push(tok.to_string()),
+        }
+    }
+
+    if hard == Some(true) && soft == Some(true) {
+        return Err(StorageError::Other(
+            "nfs options `hard` and `soft` are mutually exclusive".into(),
+        ));
+    }
+
+    Ok(OptionSet::Nfs {
+        vers,
+        hard,
+        soft,
+        timeo,
+        retrans,
+        actimeo,
+        rsize,
+        wsize,
+        netdev,
+        extra,
+    })
+}
+
+/// Bounds-check a transfer size (`rsize`/`wsize`).
+fn check_xsize(key: &str, n: u32) -> Result<u32, StorageError> {
+    if !(MIN_XSIZE..=MAX_XSIZE).contains(&n) {
+        return Err(StorageError::Other(format!(
+            "nfs option `{key}={n}` out of range ({MIN_XSIZE}..={MAX_XSIZE} bytes)"
+        )));
+    }
+    Ok(n)
+}
+
 // ── storage domain backend ──────────────────────────────────────────────────
 
 /// NFS/SMB network-share backend for the `storage` domain. Contributes the
@@ -566,6 +750,43 @@ impl StorageBackend for NfsBackend {
 
     fn endpoint(&self) -> String {
         "nfs://local".to_string()
+    }
+
+    /// nfs mounts are kernel mounts realized through autofs — the default.
+    fn mount_style(&self) -> MountStyle {
+        MountStyle::KernelMount
+    }
+
+    /// Parse + validate an nfs mount spec into a typed [`OptionSet::Nfs`],
+    /// rejecting malformed or conflicting options (bad `vers`, `hard`+`soft`,
+    /// out-of-range numerics) at declare time. The source (and any failover
+    /// sources) are normalized to canonical `host:/export` form.
+    async fn validate_spec(&self, spec: &MountSpec) -> Result<NormalizedSpec, StorageError> {
+        let options = parse_nfs_options(spec.options.as_deref())?;
+        let source = normalize_nfs_source(&spec.source)?;
+        let failover_sources = spec
+            .failover_sources
+            .iter()
+            .map(|s| normalize_nfs_source(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(NormalizedSpec {
+            backend: spec.backend.clone(),
+            target: spec.target.clone(),
+            fstype: spec.fstype.clone(),
+            source,
+            failover_sources,
+            options,
+            credential: spec.credential.clone(),
+            remount_policy: spec.remount_policy.clone(),
+            enabled: spec.enabled,
+        })
+    }
+
+    /// Emit the canonical comma-separated nfs option string autofs's `-fstype`
+    /// line consumes. Delegates to the storage domain's canonical renderer so the
+    /// grammar has a single source of truth and round-trips with `validate_spec`.
+    fn render_options(&self, spec: &NormalizedSpec) -> String {
+        render_option_set(&spec.options)
     }
 
     async fn list_shares(&self) -> Result<Vec<Share>, StorageError> {
@@ -895,5 +1116,134 @@ proc /proc proc defaults 0 0
             Err(NfsError::MountAll { .. }) => {}
             Err(other) => panic!("unexpected error variant: {other}"),
         }
+    }
+
+    // ── nfs option grammar (Phase 2 mount contract) ───────────────────────────
+
+    fn nfs_mount_spec(source: &str, options: Option<&str>) -> MountSpec {
+        MountSpec {
+            backend: "nfs".into(),
+            target: "/mnt/downloads".into(),
+            fstype: "nfs4".into(),
+            source: source.into(),
+            failover_sources: vec![],
+            options: options.map(str::to_string),
+            credential: None,
+            remount_policy: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn mount_style_is_kernel_mount() {
+        assert_eq!(NfsBackend::default().mount_style(), MountStyle::KernelMount);
+    }
+
+    #[test]
+    fn parse_options_rejects_hard_and_soft_together() {
+        let err = parse_nfs_options(Some("hard,soft")).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_options_rejects_bad_vers() {
+        let err = parse_nfs_options(Some("vers=5")).unwrap_err();
+        assert!(err.to_string().contains("vers=5"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_options_rejects_out_of_range_numerics() {
+        assert!(parse_nfs_options(Some("timeo=0")).is_err());
+        assert!(parse_nfs_options(Some("rsize=1024")).is_err());
+        assert!(parse_nfs_options(Some("wsize=33554432")).is_err());
+        assert!(parse_nfs_options(Some("timeo=notanumber")).is_err());
+        // Value-less option that requires a value, and vice-versa.
+        assert!(parse_nfs_options(Some("vers")).is_err());
+        assert!(parse_nfs_options(Some("hard=1")).is_err());
+    }
+
+    #[test]
+    fn parse_options_happy_path_types_and_passthrough() {
+        let set = parse_nfs_options(Some(
+            "vers=4.2,hard,timeo=600,retrans=2,actimeo=30,rsize=1048576,wsize=1048576,_netdev,nofail,nconnect=4",
+        ))
+        .unwrap();
+        match set {
+            OptionSet::Nfs {
+                vers,
+                hard,
+                soft,
+                timeo,
+                retrans,
+                actimeo,
+                rsize,
+                wsize,
+                netdev,
+                extra,
+            } => {
+                assert_eq!(vers.as_deref(), Some("4.2"));
+                assert_eq!(hard, Some(true));
+                assert_eq!(soft, None);
+                assert_eq!(timeo, Some(600));
+                assert_eq!(retrans, Some(2));
+                assert_eq!(actimeo, Some(30));
+                assert_eq!(rsize, Some(1048576));
+                assert_eq!(wsize, Some(1048576));
+                assert!(netdev);
+                assert_eq!(extra, vec!["nofail".to_string(), "nconnect=4".to_string()]);
+            }
+            other => panic!("expected OptionSet::Nfs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_source_canonicalizes_and_rejects_malformed() {
+        assert_eq!(
+            normalize_nfs_source(" 10.10.10.10:/mnt/user/downloads ").unwrap(),
+            "10.10.10.10:/mnt/user/downloads"
+        );
+        assert!(normalize_nfs_source("").is_err());
+        assert!(normalize_nfs_source("no-colon-path").is_err());
+        assert!(normalize_nfs_source("host:relative/export").is_err());
+        assert!(normalize_nfs_source(":/export").is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_spec_rejects_conflicting_options() {
+        let backend = NfsBackend::default();
+        let spec = nfs_mount_spec("10.10.10.10:/mnt/user/downloads", Some("hard,soft"));
+        assert!(backend.validate_spec(&spec).await.is_err());
+    }
+
+    // The freyr example: this exact spec must validate, normalize to a single
+    // source with no failover, and render back to the canonical option string.
+    #[tokio::test]
+    async fn validate_and_render_round_trips_freyr_example() {
+        let backend = NfsBackend::default();
+        let spec = nfs_mount_spec(
+            "10.10.10.10:/mnt/user/downloads",
+            Some("hard,timeo=600,retrans=2,_netdev,nofail"),
+        );
+        let normalized = backend.validate_spec(&spec).await.expect("validate");
+
+        assert_eq!(normalized.source, "10.10.10.10:/mnt/user/downloads");
+        assert!(
+            normalized.failover_sources.is_empty(),
+            "single source, no failover"
+        );
+        assert_eq!(
+            backend.render_options(&normalized),
+            "hard,timeo=600,retrans=2,_netdev,nofail"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_spec_normalizes_failover_sources() {
+        let backend = NfsBackend::default();
+        let mut spec = nfs_mount_spec("nas1:/export/pool", Some("vers=4.1"));
+        spec.failover_sources = vec![" nas2:/export/pool ".into()];
+        let normalized = backend.validate_spec(&spec).await.expect("validate");
+        assert_eq!(normalized.source, "nas1:/export/pool");
+        assert_eq!(normalized.failover_sources, vec!["nas2:/export/pool"]);
     }
 }
