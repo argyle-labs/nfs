@@ -11,11 +11,15 @@ use plugin_toolkit::orca_async;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
 use plugin_toolkit::storage::{
-    render_option_set, Capability, MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionSet,
-    RecoverOutcome, Share, StorageBackend, StorageError, StorageKind,
+    mount_table_of, probe_health, render_option_set, Capability, Health, MountOutcome, MountSpec,
+    MountStyle, NormalizedSpec, OptionSet, RecoverOutcome, Share, StorageBackend, StorageError,
+    StorageKind,
 };
 
-const PROC_MOUNTS: &str = "/proc/mounts";
+/// Network filesystem types this crate reports on. Single source shared by the
+/// live mount-table read ([`read_mounts`]) and the stream parser's fstype gate
+/// ([`is_network_fs`]) so both agree on what counts as a network mount.
+const NETWORK_FSTYPES: &[&str] = &["nfs", "nfs4", "cifs", "smbfs"];
 const FSTAB: &str = "/etc/fstab";
 
 #[derive(Debug)]
@@ -123,15 +127,28 @@ pub struct RecoverResult {
     pub consumers: Option<ConsumerRecoverResult>,
 }
 
-/// Network filesystem types this crate reports on.
+/// Is `fstype` one of the network filesystems this crate reports on?
 fn is_network_fs(fstype: &str) -> bool {
-    matches!(fstype, "nfs" | "nfs4" | "cifs" | "smbfs")
+    NETWORK_FSTYPES.contains(&fstype)
 }
 
-/// Read `/proc/mounts` into a typed list. Returns only network mounts.
+/// Read the live kernel mount table into a typed list, filtered to network
+/// mounts. Sourced from the storage domain's generic `mount_table_of` so the
+/// plugin and core share ONE definition of the mount table (and its per-OS
+/// parsing) rather than reimplementing `/proc/mounts` parsing here — see
+/// nfs#16. The cross-platform stream parser [`parse_mounts`] is retained for the
+/// unit tests that exercise the parse grammar directly.
 pub fn read_mounts() -> Result<Vec<Mount>, NfsError> {
-    let f = std::fs::File::open(PROC_MOUNTS)?;
-    parse_mounts(f)
+    let table = mount_table_of(NETWORK_FSTYPES).map_err(NfsError::Read)?;
+    Ok(table
+        .into_iter()
+        .map(|e| Mount {
+            device: e.source,
+            mountpoint: e.mountpoint,
+            fstype: e.fstype,
+            health: None,
+        })
+        .collect())
 }
 
 /// Parse a /proc/mounts-formatted stream. Pulled out for cross-platform tests.
@@ -346,18 +363,20 @@ pub fn classify_stat_failure(stderr: &str) -> String {
     }
 }
 
-/// `stat <mountpoint>` with a timeout. Returns `"ok"` / `"stale"` / `"error: …"`.
-/// `stat` blocks in-kernel on a stale NFS handle when the server is unreachable
-/// (timeout → `"stale"`), but fails *fast* with `ESTALE` when the superblock was
-/// replaced under a still-pinned mount (stderr classified → `"stale"`). Both
-/// must reach the stale branch so recovery fires.
+/// Probe a mountpoint's liveness, returning `"ok"` / `"stale"` / `"error: …"`.
+///
+/// Delegates to the storage domain's generic [`probe_health`] so the plugin and
+/// core classify live-vs-stale-vs-absent identically (nfs#16). `probe_health`
+/// `stat`s the path on a worker thread with the timeout budget: a hang past the
+/// budget, an `ESTALE`, or any I/O error map to [`Health::Stale`]; a missing
+/// path (failed automount fell through to a bare dir) maps to [`Health::Missing`].
+/// Both collapse to `"stale"` here so the force-release/remount recovery fires
+/// for either. The string shape is kept for the `Mount::health` report field.
 pub async fn check_health(mountpoint: &str, timeout: Duration) -> String {
-    let fut = Command::new("stat").arg("--").arg(mountpoint).output();
-    match plugin_toolkit::time::timeout(timeout, fut).await {
-        None => "stale".to_string(),
-        Some(Err(e)) => format!("error: {e}"),
-        Some(Ok(out)) if out.status.success => "ok".to_string(),
-        Some(Ok(out)) => classify_stat_failure(&String::from_utf8_lossy(&out.stderr)),
+    match probe_health(mountpoint, timeout) {
+        Health::Ok => "ok".to_string(),
+        Health::Stale | Health::Timeout | Health::Missing => "stale".to_string(),
+        Health::Error => "error: probe failed".to_string(),
     }
 }
 
@@ -481,8 +500,9 @@ pub async fn mount_all() -> Result<(), NfsError> {
 ///
 /// Non-fatal step failures (a release failure, a `mount -a` non-zero exit) are
 /// collected into `errors` rather than aborting — the caller logs and continues
-/// its own recovery (e.g. proxmox lifecycle restart). Only a failure to read
-/// `/proc/mounts` (the initial enumeration) is fatal and returned as `Err`.
+/// its own recovery (e.g. proxmox lifecycle restart). Only a failure of the
+/// initial host mount-table read (step 1, via the storage domain's
+/// cross-platform `mount_table`) is fatal and returned as `Err`.
 pub async fn recover_stale(
     watch: &[String],
     fstype_filter: &str,
@@ -590,6 +610,82 @@ pub async fn recover_stale_with_consumers(
     Ok(result)
 }
 
+/// Is `bin` on `PATH`? Used to pick which container runtimes to sweep — a host
+/// may run Docker, Proxmox (`pct`), both, or neither.
+async fn have_binary(bin: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {bin}"))
+        .output()
+        .await
+        .map(|o| o.status.success)
+        .unwrap_or(false)
+}
+
+/// Detect the container runtimes present on this host, in a stable order. Empty
+/// when neither Docker nor Proxmox is installed (recovery is then host-only).
+pub async fn detect_runtimes() -> Vec<Box<dyn ContainerRuntime>> {
+    let mut runtimes: Vec<Box<dyn ContainerRuntime>> = Vec::new();
+    if have_binary("docker").await {
+        runtimes.push(Box::new(DockerCli));
+    }
+    if have_binary("pct").await {
+        runtimes.push(Box::new(PctCli));
+    }
+    runtimes
+}
+
+/// Full self-heal across MANY container runtimes: the host sweep runs ONCE, then
+/// every supplied runtime's consumer sweep (stale-bind restart) and start-gate
+/// (stopped-guest auto-start) runs against the shared post-recovery host-health
+/// snapshot, folding all consumer outcomes into one [`ConsumerRecoverResult`].
+/// This is the entry point the storage `recover` verb drives so a host running
+/// both Docker and Proxmox heals guests under either — see nfs#16.
+///
+/// A single-runtime caller can still use [`recover_stale_with_consumers`]; this
+/// is its N-runtime generalization without repeating the host sweep per runtime.
+pub async fn recover_stale_multi(
+    runtimes: &[Box<dyn ContainerRuntime>],
+    watch: &[String],
+    fstype_filter: &str,
+    health_timeout: Duration,
+) -> Result<RecoverResult, NfsError> {
+    let mut result = recover_stale(watch, fstype_filter, health_timeout).await?;
+
+    // One post-recovery snapshot shared by every runtime's guard (same as the
+    // single-runtime path), so N runtimes do not re-probe the host N times.
+    let mounts = list(watch, fstype_filter, health_timeout).await?;
+    let host_healthy = |source: &str| host_source_healthy(source, &mounts);
+
+    let mut merged = ConsumerRecoverResult {
+        no_consumers_found: true,
+        ..Default::default()
+    };
+    for rt in runtimes {
+        let c = recover_stale_consumers(rt.as_ref(), watch, health_timeout, &host_healthy).await;
+        if !c.no_consumers_found {
+            merged.no_consumers_found = false;
+        }
+        merged.healthy.extend(c.healthy);
+        merged.recovered.extend(c.recovered);
+        merged.skipped_host_stale.extend(c.skipped_host_stale);
+        merged.still_stale.extend(c.still_stale);
+        merged.errors.extend(c.errors);
+
+        // Hook replacement: start stopped guests whose managed bind's host mount
+        // is now healthy. Reported as `started:<name>` in `recovered`.
+        let started = rt.start_gated(watch, &host_healthy).await;
+        if !started.is_empty() {
+            merged.no_consumers_found = false;
+            merged
+                .recovered
+                .extend(started.into_iter().map(|n| format!("started:{n}")));
+        }
+    }
+    result.consumers = Some(merged);
+    Ok(result)
+}
+
 /// Is the host mount covering `source` healthy? Finds the longest mountpoint
 /// that is a prefix of `source` (the mount the bind actually resolves through)
 /// and returns whether its last health probe was `ok`. An uncovered or
@@ -666,6 +762,23 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Restart container `id` to re-bind the fresh mount.
     async fn restart(&self, id: &str) -> Result<(), NfsError>;
+
+    /// Start any consumer that is currently STOPPED, declares a bind of a watched
+    /// host path, and whose covering host mount is healthy — the orca-owned
+    /// replacement for a host-local "refuse start until the mount is live" hook
+    /// that never retries (nfs#16, the frigg jellyfin-stopped-for-days incident).
+    /// `host_healthy(host_source)` gates the start exactly like the restart path,
+    /// so a host-wide outage never starts a fleet of guests against a dead mount.
+    /// Returns the names started. Runtimes with no notion of a stopped-but-
+    /// configured consumer — e.g. Docker, whose sweep only ever sees running
+    /// containers — keep the default no-op.
+    async fn start_gated(
+        &self,
+        _watch: &[String],
+        _host_healthy: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Does a host path fall under one of the watched prefixes? Shares prefix
@@ -920,6 +1033,251 @@ fn parse_docker_binds(raw: &str, watch: &[String]) -> Vec<ConsumerBind> {
             container_name: name.trim_start_matches('/').to_string(),
             host_source: source.to_string(),
             container_target: dest.to_string(),
+        });
+    }
+    out
+}
+
+/// One Proxmox guest row from `pct list` (LXC container). `status` is the raw
+/// `pct` state string (`running` / `stopped`); `name` is the guest hostname.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PctGuest {
+    pub vmid: String,
+    pub status: String,
+    pub name: String,
+}
+
+/// Production [`ContainerRuntime`] for Proxmox LXC guests, shelling `pct` via
+/// `plugin_toolkit::process::Command`. Mirrors [`DockerCli`]: every `pct`
+/// shell-out is confined here so the sweep stays runtime-agnostic and mockable.
+/// Unlike Docker, a Proxmox guest can be STOPPED yet still declare a managed
+/// bind in its config — the frigg incident where jellyfin (LXC 113) sat stopped
+/// because a host-local start-gate hook never retried — so this runtime also
+/// implements [`ContainerRuntime::start_gated`].
+pub struct PctCli;
+
+/// `pct list` → typed guest rows. Best-effort shell-out; a `pct` failure is a
+/// hard `Err` (the caller records it), mirroring `DockerCli::binds_under`.
+async fn pct_list() -> Result<Vec<PctGuest>, NfsError> {
+    let out = Command::new("pct")
+        .arg("list")
+        .output()
+        .await
+        .map_err(NfsError::Read)?;
+    if !out.status.success {
+        return Err(NfsError::Read(std::io::Error::other(format!(
+            "pct list exit {:?}: {}",
+            out.status.code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))));
+    }
+    Ok(parse_pct_list(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// `pct config <vmid>` → raw config text.
+async fn pct_config(vmid: &str) -> Result<String, NfsError> {
+    let out = Command::new("pct")
+        .arg("config")
+        .arg(vmid)
+        .output()
+        .await
+        .map_err(NfsError::Read)?;
+    if !out.status.success {
+        return Err(NfsError::Read(std::io::Error::other(format!(
+            "pct config {vmid} exit {:?}: {}",
+            out.status.code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `pct start <vmid>`.
+async fn pct_start(vmid: &str) -> Result<(), NfsError> {
+    let out = Command::new("pct")
+        .arg("start")
+        .arg(vmid)
+        .output()
+        .await
+        .map_err(NfsError::Read)?;
+    if out.status.success {
+        Ok(())
+    } else {
+        Err(NfsError::Read(std::io::Error::other(format!(
+            "pct start {vmid} exit {:?}: {}",
+            out.status.code,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))))
+    }
+}
+
+#[orca_async]
+impl ContainerRuntime for PctCli {
+    async fn binds_under(&self, watch: &[String]) -> Result<Vec<ConsumerBind>, NfsError> {
+        // Only RUNNING guests can be `pct exec`-probed; stopped guests are the
+        // start_gated path. Collect the managed binds of each running guest.
+        let mut out = Vec::new();
+        for g in pct_list().await?.iter().filter(|g| g.status == "running") {
+            let cfg = pct_config(&g.vmid).await?;
+            out.extend(parse_pct_config_binds(&g.vmid, &g.name, &cfg, watch));
+        }
+        Ok(out)
+    }
+
+    async fn probe_path(
+        &self,
+        id: &str,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<ConsumerProbe, NfsError> {
+        let fut = Command::new("pct")
+            .arg("exec")
+            .arg(id)
+            .arg("--")
+            .arg("stat")
+            .arg("--")
+            .arg(path)
+            .output();
+        match plugin_toolkit::time::timeout(timeout, fut).await {
+            // In-guest `stat` hung past the budget → stale (same rule as the host
+            // probe's timeout→stale).
+            None => Ok(ConsumerProbe::Stale),
+            Some(Err(e)) => Err(NfsError::Read(e)),
+            Some(Ok(out)) if out.status.success => Ok(ConsumerProbe::Ok),
+            Some(Ok(out)) => {
+                if classify_stat_failure(&String::from_utf8_lossy(&out.stderr)) == "stale" {
+                    Ok(ConsumerProbe::Stale)
+                } else {
+                    Err(NfsError::Read(std::io::Error::other(
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    )))
+                }
+            }
+        }
+    }
+
+    async fn restart(&self, id: &str) -> Result<(), NfsError> {
+        let out = Command::new("pct")
+            .arg("reboot")
+            .arg(id)
+            .output()
+            .await
+            .map_err(NfsError::Read)?;
+        if out.status.success {
+            Ok(())
+        } else {
+            Err(NfsError::Read(std::io::Error::other(format!(
+                "pct reboot {id} exit {:?}: {}",
+                out.status.code,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))))
+        }
+    }
+
+    async fn start_gated(
+        &self,
+        watch: &[String],
+        host_healthy: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Vec<String> {
+        let guests = match pct_list().await {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut started = Vec::new();
+        for g in guests.iter().filter(|g| g.status == "stopped") {
+            let Ok(cfg) = pct_config(&g.vmid).await else {
+                continue;
+            };
+            let binds = parse_pct_config_binds(&g.vmid, &g.name, &cfg, watch);
+            // Start only when a managed bind's covering host mount is healthy —
+            // never start a guest against a stale/absent mount (the guard the old
+            // hook only ever applied at the "refuse" edge, never the retry edge).
+            if binds.iter().any(|b| host_healthy(&b.host_source))
+                && pct_start(&g.vmid).await.is_ok()
+            {
+                started.push(g.name.clone());
+            }
+        }
+        started
+    }
+}
+
+/// Parse `pct list` output into guest rows. The columns are `VMID Status [Lock]
+/// Name` with a variable-width, sometimes-empty `Lock`; `Name` is always last.
+/// Pure so it's testable without `pct`.
+fn parse_pct_list(raw: &str) -> Vec<PctGuest> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("VMID") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Need at least vmid + status + name; take vmid/status from the front and
+        // name from the end so a present-or-absent Lock column doesn't shift it.
+        let (Some(vmid), Some(status), Some(name)) = (fields.first(), fields.get(1), fields.last())
+        else {
+            continue;
+        };
+        if !vmid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        out.push(PctGuest {
+            vmid: vmid.to_string(),
+            status: status.to_string(),
+            name: name.to_string(),
+        });
+    }
+    out
+}
+
+/// Parse the `mpN:` bind entries from a `pct config <vmid>` dump, keeping only
+/// binds whose host source falls under a watched prefix. Proxmox renders a
+/// mountpoint as `mpN: <volume-or-hostpath>,mp=<container_path>[,opt...]`. A
+/// **bind** of a host directory has an absolute path as its first token; a
+/// storage-volume mount (e.g. `local-lvm:vm-113-disk-1`) does not and is
+/// skipped — only host binds can carry a managed NFS path. Pure so it's testable
+/// without `pct`.
+fn parse_pct_config_binds(
+    vmid: &str,
+    name: &str,
+    config_raw: &str,
+    watch: &[String],
+) -> Vec<ConsumerBind> {
+    let mut out = Vec::new();
+    for line in config_raw.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        // mpN: keys are the additional mountpoints; rootfs is never a network bind.
+        let key = key.trim();
+        if !(key.starts_with("mp") && key.len() > 2 && key[2..].chars().all(|c| c.is_ascii_digit()))
+        {
+            continue;
+        }
+        let mut parts = value.trim().split(',');
+        let Some(source) = parts.next().map(str::trim) else {
+            continue;
+        };
+        // Host bind, not a storage volume: absolute path only.
+        if !source.starts_with('/') {
+            continue;
+        }
+        let Some(target) = parts
+            .find_map(|p| p.trim().strip_prefix("mp="))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if !path_under_watch(source, watch) {
+            continue;
+        }
+        out.push(ConsumerBind {
+            container_id: vmid.to_string(),
+            container_name: name.to_string(),
+            host_source: source.to_string(),
+            container_target: target.to_string(),
         });
     }
     out
@@ -1233,12 +1591,14 @@ impl StorageBackend for NfsBackend {
         health_timeout: Duration,
     ) -> Result<RecoverOutcome, StorageError> {
         // The storage `recover` verb drives the FULL self-heal: host sweep then
-        // the consumer-aware bind-mount sweep (guarded on host-health), using the
-        // production `DockerCli` runtime. `RecoverOutcome` is a closed toolkit
-        // type with no consumer fields, so consumer results are folded into its
-        // existing vecs with a `consumer:` tag so a caller can still see them.
-        let runtime = DockerCli;
-        let mut r = recover_stale_with_consumers(&runtime, watch, "", health_timeout)
+        // the consumer-aware bind-mount sweep (guarded on host-health) across
+        // EVERY container runtime present on the host — Docker and/or Proxmox
+        // (`pct`). `RecoverOutcome` is a closed toolkit type with no consumer
+        // fields, so consumer results are folded into its existing vecs with a
+        // `consumer:` tag (and `started:` for stopped guests brought up) so a
+        // caller can still see them.
+        let runtimes = detect_runtimes().await;
+        let mut r = recover_stale_multi(&runtimes, watch, "", health_timeout)
             .await
             .map_err(|e| StorageError::Transport(e.to_string()))?;
         let mut recovered = r.recovered;
@@ -1443,9 +1803,14 @@ proc /proc proc defaults 0 0
     }
 
     #[tokio::test]
-    async fn check_health_returns_error_for_missing_path() {
+    async fn check_health_returns_stale_for_missing_path() {
+        // New contract (nfs#16): health probing delegates to the storage domain's
+        // `probe_health`, which maps a missing path to `Health::Missing`. A failed
+        // automount that fell through to a bare/absent dir must reach the recovery
+        // path, so `check_health` collapses Missing → "stale" (it used to `stat`
+        // and return "error: …", which never triggered remount).
         let s = check_health("/definitely/not/here/orca_nfs_test", Duration::from_secs(5)).await;
-        assert!(s.starts_with("error:"));
+        assert_eq!(s, "stale");
     }
 
     #[test]
@@ -1478,37 +1843,44 @@ proc /proc proc defaults 0 0
         assert!(s == "stale" || s == "ok");
     }
 
-    // Linux-only paths (`read_mounts`, `list`, `release`) all hit /proc/mounts
-    // which doesn't exist on macOS. Exercise the Err path on non-Linux so
-    // those functions still get coverage in CI runners that aren't Linux.
+    // New contract (nfs#16): `read_mounts` no longer reads `/proc/mounts`
+    // directly — it delegates to the storage domain's cross-platform
+    // `mount_table_of` (`/proc/mounts` on Linux, `/sbin/mount` on macOS). So the
+    // read path SUCCEEDS off-Linux instead of erroring, and `list`/`release`
+    // ride that success. Exercised on non-Linux so those paths keep coverage in
+    // CI runners that aren't Linux.
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn read_mounts_errors_when_proc_mounts_absent() {
-        let err = read_mounts().unwrap_err();
-        assert!(matches!(err, NfsError::Read(_)));
+    fn read_mounts_reads_cross_platform() {
+        // Cross-platform read: Ok on macOS (was Err when it opened /proc/mounts).
+        assert!(read_mounts().is_ok());
     }
 
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
-    async fn list_propagates_read_mounts_failure() {
-        let res = list(&[], "", Duration::from_secs(1)).await;
-        assert!(res.is_err());
+    async fn list_reads_cross_platform() {
+        assert!(list(&[], "", Duration::from_secs(1)).await.is_ok());
     }
 
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
-    async fn release_propagates_read_mounts_failure() {
-        // Both force modes must surface the enumeration error.
-        assert!(release("", "", false).await.is_err());
-        assert!(release("", "", true).await.is_err());
+    async fn release_reads_cross_platform() {
+        // Both force modes enumerate via the cross-platform read and succeed
+        // (no matching network mounts on a non-Linux test host → no-op Ok).
+        assert!(release("", "", false).await.is_ok());
+        assert!(release("", "", true).await.is_ok());
     }
 
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
-    async fn recover_stale_propagates_read_mounts_failure() {
-        // Initial enumeration failure is the one fatal path.
+    async fn recover_stale_reads_cross_platform() {
+        // The step-1 host mount read now succeeds cross-platform (was the sole
+        // fatal path when it opened /proc/mounts), and the `/etc/fstab` scan is
+        // best-effort — so the sweep returns `Ok` off-Linux instead of an
+        // enumeration `Err`. (Whether anything was stale depends on the host's
+        // live mount state, so only the non-fatal contract is asserted here.)
         let res = recover_stale(&[], "", Duration::from_secs(1)).await;
-        assert!(res.is_err());
+        assert!(res.is_ok());
     }
 
     #[test]
@@ -1559,6 +1931,58 @@ ghi\t/other\t/srv/other\t/srv
         assert_eq!(binds[0].host_source, "/mnt/pool/downloads");
         assert_eq!(binds[0].container_target, "/data");
         assert_eq!(binds[1].container_target, "/media");
+    }
+
+    #[test]
+    fn parse_pct_list_skips_header_and_reads_status_and_name() {
+        // Header, a running guest with no lock, a stopped guest, and a locked
+        // guest (lock column present) whose Name must still land as the last col.
+        let raw = "\
+VMID       Status     Lock         Name
+113        running                 jellyfin
+114        stopped                 sonarr
+115        running    backup       radarr
+";
+        let guests = parse_pct_list(raw);
+        assert_eq!(guests.len(), 3);
+        assert_eq!(guests[0].vmid, "113");
+        assert_eq!(guests[0].status, "running");
+        assert_eq!(guests[0].name, "jellyfin");
+        assert_eq!(guests[1].status, "stopped");
+        assert_eq!(guests[1].name, "sonarr");
+        // Lock column present — Name is still parsed from the end.
+        assert_eq!(guests[2].name, "radarr");
+    }
+
+    #[test]
+    fn parse_pct_config_binds_keeps_host_binds_under_watch_only() {
+        // mp0 host bind under watch; mp1 host bind outside watch; mp2 storage
+        // volume (not a host path); rootfs ignored. Only mp0 survives.
+        let cfg = "\
+arch: amd64
+hostname: jellyfin
+mp0: /mnt/pool/media,mp=/data/media
+mp1: /srv/local,mp=/srv
+mp2: local-lvm:vm-113-disk-1,mp=/scratch
+rootfs: local-lvm:vm-113-disk-0,size=8G
+";
+        let watch = vec!["/mnt/pool".to_string()];
+        let binds = parse_pct_config_binds("113", "jellyfin", cfg, &watch);
+        assert_eq!(binds.len(), 1, "only the watched host bind");
+        assert_eq!(binds[0].container_id, "113");
+        assert_eq!(binds[0].container_name, "jellyfin");
+        assert_eq!(binds[0].host_source, "/mnt/pool/media");
+        assert_eq!(binds[0].container_target, "/data/media");
+    }
+
+    #[test]
+    fn parse_pct_config_binds_extracts_mp_after_options() {
+        // `mp=` need not be the second field; extra options may precede it.
+        let cfg = "mp0: /mnt/pool/data,backup=1,mp=/data,ro=1\n";
+        let watch = vec!["/mnt/pool".to_string()];
+        let binds = parse_pct_config_binds("120", "app", cfg, &watch);
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].container_target, "/data");
     }
 
     #[test]
