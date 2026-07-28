@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use plugin_toolkit::orca_async;
 use plugin_toolkit::prelude::*;
-use plugin_toolkit::process::Command;
+use plugin_toolkit::process::{Command, ToolError};
 use plugin_toolkit::storage::{
-    mount_table_of, probe_health, render_option_set, Capability, Health, MountOutcome, MountSpec,
-    MountStyle, NormalizedSpec, OptionSet, RecoverOutcome, Share, StorageBackend, StorageError,
-    StorageKind,
+    apply_option_floor, mount_table_of, parse_option_string, probe_health, Capability, Health,
+    MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome,
+    Share, StorageBackend, StorageError, StorageKind,
 };
 
 /// Network filesystem types this crate reports on. Single source shared by the
@@ -68,6 +68,14 @@ impl From<std::io::Error> for NfsError {
     fn from(e: std::io::Error) -> Self {
         NfsError::Read(e)
     }
+}
+
+/// Fold a [`ToolError`] from [`Command::run_checked`] into the `std::io::Error`
+/// the failure-carrying [`NfsError`] variants (`MountAll`/`Remount`/`Umount`)
+/// wrap, preserving the exact `exit {code:?}: {stderr}` context those variants
+/// rendered before they were routed through `run_checked`.
+fn tool_error_to_io(e: &ToolError) -> std::io::Error {
+    std::io::Error::other(format!("exit {:?}: {}", e.code, e.stderr))
 }
 
 #[plugin_struct]
@@ -237,15 +245,8 @@ pub fn missing_mounts(watch: &[String]) -> Result<Vec<FstabEntry>, NfsError> {
     let live = read_mounts()?;
     let mut expected = read_fstab()?;
     if !watch.is_empty() {
-        expected.retain(|e| {
-            watch
-                .iter()
-                .any(|w| match e.mountpoint.strip_prefix(w.as_str()) {
-                    Some("") => true,
-                    Some(rest) => rest.starts_with('/'),
-                    None => false,
-                })
-        });
+        // TODO(routes): converges to the shared routes array (WS2) — do not abstract to core yet
+        expected.retain(|e| path_under_watch(&e.mountpoint, watch));
     }
     expected.retain(|e| !live.iter().any(|m| m.mountpoint == e.mountpoint));
     Ok(expected)
@@ -271,49 +272,31 @@ pub async fn remount_one(entry: &FstabEntry) -> Result<(), NfsError> {
             drop(reset);
         }
     }
-    let out = Command::new("mount")
+    Command::new("mount")
         .arg(&entry.mountpoint)
-        .output()
+        .run_checked()
         .await
-        .map_err(|source| NfsError::Remount {
+        .map(|_stdout| ())
+        .map_err(|e| NfsError::Remount {
             mountpoint: entry.mountpoint.clone(),
-            source,
-        })?;
-    if out.status.success {
-        Ok(())
-    } else {
-        Err(NfsError::Remount {
-            mountpoint: entry.mountpoint.clone(),
-            source: std::io::Error::other(format!(
-                "exit {:?}: {}",
-                out.status.code,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
+            source: tool_error_to_io(&e),
         })
-    }
 }
 
 /// Resolve the systemd unit name for a mountpoint (e.g. `/mnt/<pool>/data` →
 /// `mnt-pool-data.automount`) via `systemd-escape -p --suffix=<suffix>`.
 async fn systemd_escape(mountpoint: &str, suffix: &str) -> Result<String, NfsError> {
-    let out = Command::new("systemd-escape")
+    let stdout = Command::new("systemd-escape")
         .arg("-p")
         .arg(format!("--suffix={suffix}"))
         .arg(mountpoint)
-        .output()
+        .run_checked()
         .await
-        .map_err(|source| NfsError::Remount {
-            mountpoint: mountpoint.to_string(),
-            source,
-        })?;
-    if out.status.success {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(NfsError::Remount {
+        .map_err(|_e| NfsError::Remount {
             mountpoint: mountpoint.to_string(),
             source: std::io::Error::other("systemd-escape failed"),
-        })
-    }
+        })?;
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Restrict mounts to a configured watch list. `/foo` matches `/foo` and
@@ -322,17 +305,10 @@ pub fn filter_watch(mounts: Vec<Mount>, watch: &[String]) -> Vec<Mount> {
     if watch.is_empty() {
         return mounts;
     }
+    // TODO(routes): converges to the shared routes array (WS2) — do not abstract to core yet
     mounts
         .into_iter()
-        .filter(|m| {
-            watch
-                .iter()
-                .any(|w| match m.mountpoint.strip_prefix(w.as_str()) {
-                    Some("") => true,
-                    Some(rest) => rest.starts_with('/'),
-                    None => false,
-                })
-        })
+        .filter(|m| path_under_watch(&m.mountpoint, watch))
         .collect()
 }
 
@@ -461,22 +437,14 @@ pub async fn release(
 /// A non-zero exit is surfaced as [`NfsError::MountAll`] carrying stderr so the
 /// caller can decide whether to log-and-continue or fail.
 pub async fn mount_all() -> Result<(), NfsError> {
-    let out = Command::new("mount")
+    Command::new("mount")
         .arg("-a")
-        .output()
+        .run_checked()
         .await
-        .map_err(|source| NfsError::MountAll { source })?;
-    if out.status.success {
-        Ok(())
-    } else {
-        Err(NfsError::MountAll {
-            source: std::io::Error::other(format!(
-                "exit {:?}: {}",
-                out.status.code,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
+        .map(|_stdout| ())
+        .map_err(|e| NfsError::MountAll {
+            source: tool_error_to_io(&e),
         })
-    }
 }
 
 /// Orchestrated recovery for one host's network mounts. Handles **two** distinct
@@ -913,22 +881,20 @@ const DOCKER_BIND_FORMAT: &str = "{{range .Mounts}}{{if eq .Type \"bind\"}}{{$.I
 impl ContainerRuntime for DockerCli {
     async fn binds_under(&self, watch: &[String]) -> Result<Vec<ConsumerBind>, NfsError> {
         // Running container ids first, then inspect their bind mounts.
-        let out = Command::new("docker")
+        let stdout = Command::new("docker")
             .arg("ps")
             .arg("--no-trunc")
             .arg("--format")
             .arg("{{.ID}}")
-            .output()
+            .run_checked()
             .await
-            .map_err(NfsError::Read)?;
-        if !out.status.success {
-            return Err(NfsError::Read(std::io::Error::other(format!(
-                "docker ps exit {:?}: {}",
-                out.status.code,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))));
-        }
-        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .map_err(|e| {
+                NfsError::Read(std::io::Error::other(format!(
+                    "docker ps exit {:?}: {}",
+                    e.code, e.stderr
+                )))
+            })?;
+        let ids: Vec<String> = String::from_utf8_lossy(&stdout)
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
@@ -944,18 +910,13 @@ impl ContainerRuntime for DockerCli {
         for id in &ids {
             inspect = inspect.arg(id);
         }
-        let out = inspect.output().await.map_err(NfsError::Read)?;
-        if !out.status.success {
-            return Err(NfsError::Read(std::io::Error::other(format!(
+        let stdout = inspect.run_checked().await.map_err(|e| {
+            NfsError::Read(std::io::Error::other(format!(
                 "docker inspect exit {:?}: {}",
-                out.status.code,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))));
-        }
-        Ok(parse_docker_binds(
-            &String::from_utf8_lossy(&out.stdout),
-            watch,
-        ))
+                e.code, e.stderr
+            )))
+        })?;
+        Ok(parse_docker_binds(&String::from_utf8_lossy(&stdout), watch))
     }
 
     async fn probe_path(
@@ -990,21 +951,18 @@ impl ContainerRuntime for DockerCli {
     }
 
     async fn restart(&self, id: &str) -> Result<(), NfsError> {
-        let out = Command::new("docker")
+        Command::new("docker")
             .arg("restart")
             .arg(id)
-            .output()
+            .run_checked()
             .await
-            .map_err(NfsError::Read)?;
-        if out.status.success {
-            Ok(())
-        } else {
-            Err(NfsError::Read(std::io::Error::other(format!(
-                "docker restart {id} exit {:?}: {}",
-                out.status.code,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))))
-        }
+            .map(|_stdout| ())
+            .map_err(|e| {
+                NfsError::Read(std::io::Error::other(format!(
+                    "docker restart {id} exit {:?}: {}",
+                    e.code, e.stderr
+                )))
+            })
     }
 }
 
@@ -1059,56 +1017,49 @@ pub struct PctCli;
 /// `pct list` → typed guest rows. Best-effort shell-out; a `pct` failure is a
 /// hard `Err` (the caller records it), mirroring `DockerCli::binds_under`.
 async fn pct_list() -> Result<Vec<PctGuest>, NfsError> {
-    let out = Command::new("pct")
+    let stdout = Command::new("pct")
         .arg("list")
-        .output()
+        .run_checked()
         .await
-        .map_err(NfsError::Read)?;
-    if !out.status.success {
-        return Err(NfsError::Read(std::io::Error::other(format!(
-            "pct list exit {:?}: {}",
-            out.status.code,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))));
-    }
-    Ok(parse_pct_list(&String::from_utf8_lossy(&out.stdout)))
+        .map_err(|e| {
+            NfsError::Read(std::io::Error::other(format!(
+                "pct list exit {:?}: {}",
+                e.code, e.stderr
+            )))
+        })?;
+    Ok(parse_pct_list(&String::from_utf8_lossy(&stdout)))
 }
 
 /// `pct config <vmid>` → raw config text.
 async fn pct_config(vmid: &str) -> Result<String, NfsError> {
-    let out = Command::new("pct")
+    let stdout = Command::new("pct")
         .arg("config")
         .arg(vmid)
-        .output()
+        .run_checked()
         .await
-        .map_err(NfsError::Read)?;
-    if !out.status.success {
-        return Err(NfsError::Read(std::io::Error::other(format!(
-            "pct config {vmid} exit {:?}: {}",
-            out.status.code,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        .map_err(|e| {
+            NfsError::Read(std::io::Error::other(format!(
+                "pct config {vmid} exit {:?}: {}",
+                e.code, e.stderr
+            )))
+        })?;
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 /// `pct start <vmid>`.
 async fn pct_start(vmid: &str) -> Result<(), NfsError> {
-    let out = Command::new("pct")
+    Command::new("pct")
         .arg("start")
         .arg(vmid)
-        .output()
+        .run_checked()
         .await
-        .map_err(NfsError::Read)?;
-    if out.status.success {
-        Ok(())
-    } else {
-        Err(NfsError::Read(std::io::Error::other(format!(
-            "pct start {vmid} exit {:?}: {}",
-            out.status.code,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))))
-    }
+        .map(|_stdout| ())
+        .map_err(|e| {
+            NfsError::Read(std::io::Error::other(format!(
+                "pct start {vmid} exit {:?}: {}",
+                e.code, e.stderr
+            )))
+        })
 }
 
 #[orca_async]
@@ -1157,21 +1108,18 @@ impl ContainerRuntime for PctCli {
     }
 
     async fn restart(&self, id: &str) -> Result<(), NfsError> {
-        let out = Command::new("pct")
+        Command::new("pct")
             .arg("reboot")
             .arg(id)
-            .output()
+            .run_checked()
             .await
-            .map_err(NfsError::Read)?;
-        if out.status.success {
-            Ok(())
-        } else {
-            Err(NfsError::Read(std::io::Error::other(format!(
-                "pct reboot {id} exit {:?}: {}",
-                out.status.code,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))))
-        }
+            .map(|_stdout| ())
+            .map_err(|e| {
+                NfsError::Read(std::io::Error::other(format!(
+                    "pct reboot {id} exit {:?}: {}",
+                    e.code, e.stderr
+                )))
+            })
     }
 
     async fn start_gated(
@@ -1285,12 +1233,14 @@ fn parse_pct_config_binds(
 
 // ── nfs option grammar ──────────────────────────────────────────────────────
 //
-// The nfs backend owns the grammar of its own mount options. `parse_nfs_options`
-// turns the raw comma string a `MountSpec` carries into a typed
-// `OptionSet::Nfs`, rejecting anything malformed or self-contradictory at declare
-// time rather than at mount time. `normalize_nfs_source` canonicalizes the
-// `host:/export` form. `render_option_set` (owned by the storage domain) is the
-// inverse — the two round-trip.
+// The nfs backend owns the grammar of its own mount options end to end — core is
+// fstype-agnostic and neither parses nor renders them. `parse_nfs_options` turns
+// the raw comma string a `MountSpec` carries into a local typed [`NfsOptions`],
+// rejecting anything malformed or self-contradictory at declare time rather than
+// at mount time. `render_nfs_options` is the inverse — it renders the canonical
+// comma string (including the resilient-default safety floor) that core stamps
+// verbatim into `OptionSet::Raw`. `normalize_nfs_source` canonicalizes the
+// `host:/export` form.
 
 /// NFS protocol versions this backend accepts for `vers=`. Anything else is a
 /// hard rejection: a bad version silently falls back in the kernel, so catching
@@ -1346,7 +1296,26 @@ fn parse_num(key: &str, value: &str) -> Result<u32, StorageError> {
         .map_err(|_| StorageError::Other(format!("nfs option `{key}` is not a number: `{value}`")))
 }
 
-/// Parse a raw comma-separated nfs option string into a typed [`OptionSet::Nfs`],
+/// The nfs backend's local typed option model. Core never sees this — it holds
+/// only the rendered `OptionSet::Raw` string. Mirrors the fields the core
+/// `OptionSet::Nfs` variant used to carry, so parsing/rendering is byte-identical
+/// to core's prior behavior.
+#[derive(Debug, Clone, PartialEq)]
+struct NfsOptions {
+    vers: Option<String>,
+    hard: Option<bool>,
+    soft: Option<bool>,
+    timeo: Option<u32>,
+    retrans: Option<u32>,
+    actimeo: Option<u32>,
+    rsize: Option<u32>,
+    wsize: Option<u32>,
+    netdev: bool,
+    /// Any further raw `key` / `key=value` options, order-preserved.
+    extra: Vec<String>,
+}
+
+/// Parse a raw comma-separated nfs option string into a typed [`NfsOptions`],
 /// enforcing the backend's grammar:
 ///   * `vers` must be one of [`VALID_NFS_VERS`];
 ///   * `hard` and `soft` are mutually exclusive (declaring both is rejected);
@@ -1356,7 +1325,7 @@ fn parse_num(key: &str, value: &str) -> Result<u32, StorageError> {
 ///   * every other `key` / `key=value` token is preserved verbatim in `extra`,
 ///     so a legal-but-untyped option (`nconnect=4`, `nofail`, `ro`) rides
 ///     through without the backend having to enumerate the whole kernel grammar.
-fn parse_nfs_options(raw: Option<&str>) -> Result<OptionSet, StorageError> {
+fn parse_nfs_options(raw: Option<&str>) -> Result<NfsOptions, StorageError> {
     let mut vers = None;
     let mut hard = None;
     let mut soft = None;
@@ -1369,15 +1338,9 @@ fn parse_nfs_options(raw: Option<&str>) -> Result<OptionSet, StorageError> {
     let mut extra = Vec::new();
 
     let raw = raw.unwrap_or("");
-    for tok in raw.split(',') {
-        let tok = tok.trim();
-        if tok.is_empty() {
-            continue;
-        }
-        let (key, value) = match tok.split_once('=') {
-            Some((k, v)) => (k.trim(), Some(v.trim())),
-            None => (tok, None),
-        };
+    // Generic tokenizer (core mechanics); the NFS grammar below is all ours.
+    for opt in parse_option_string(raw) {
+        let (key, value) = (opt.key, opt.value);
         match (key, value) {
             ("vers" | "nfsvers", Some(v)) => {
                 if !VALID_NFS_VERS.contains(&v) {
@@ -1432,7 +1395,10 @@ fn parse_nfs_options(raw: Option<&str>) -> Result<OptionSet, StorageError> {
                 )));
             }
             // Legal-but-untyped passthrough (nofail, ro, nconnect=4, …).
-            _ => extra.push(tok.to_string()),
+            _ => extra.push(match value {
+                Some(v) => format!("{key}={v}"),
+                None => key.to_string(),
+            }),
         }
     }
 
@@ -1442,7 +1408,7 @@ fn parse_nfs_options(raw: Option<&str>) -> Result<OptionSet, StorageError> {
         ));
     }
 
-    Ok(OptionSet::Nfs {
+    Ok(NfsOptions {
         vers,
         hard,
         soft,
@@ -1454,6 +1420,75 @@ fn parse_nfs_options(raw: Option<&str>) -> Result<OptionSet, StorageError> {
         netdev,
         extra,
     })
+}
+
+/// Render a typed [`NfsOptions`] into the canonical comma-joined nfs option
+/// string, applying the resilient-default **safety floor** first. This replicates
+/// core's former `render_option_set(OptionSet::Nfs)` byte-for-byte, then layers
+/// the floor `enforce_nfs_safe_options` used to apply in core's autofs renderer —
+/// so migrating the grammar into the plugin changes no rendered output.
+///
+/// Safety floor: an NFS mount that declares neither `soft` nor `hard` inherits the
+/// kernel default of `hard`, which — when the server reboots — puts every process
+/// touching the mount into uninterruptible `D` and can wedge the whole client
+/// host. So for a mount that hasn't opted into `hard`, ensure the resilient set
+/// `soft`, `softreval`, and a fast-fail `timeo=50`/`retrans=2`. An explicit `hard`
+/// is respected and left untouched. Idempotent — never duplicates a declared one.
+fn render_nfs_options(o: &NfsOptions) -> String {
+    // Build the base token list with the generic builder; every key/flag below
+    // is NFS grammar the plugin owns.
+    let mut b = OptionBuilder::new();
+    if let Some(v) = &o.vers {
+        b.opt("vers", Some(v));
+    }
+    b.flag("hard", o.hard == Some(true))
+        .flag("soft", o.soft == Some(true));
+    if let Some(v) = o.timeo {
+        b.opt("timeo", Some(&v.to_string()));
+    }
+    if let Some(v) = o.retrans {
+        b.opt("retrans", Some(&v.to_string()));
+    }
+    if let Some(v) = o.actimeo {
+        b.opt("actimeo", Some(&v.to_string()));
+    }
+    if let Some(v) = o.rsize {
+        b.opt("rsize", Some(&v.to_string()));
+    }
+    if let Some(v) = o.wsize {
+        b.opt("wsize", Some(&v.to_string()));
+    }
+    b.flag("_netdev", o.netdev).extra(o.extra.clone());
+    // Split back into tokens so the safety floor (which reasons about presence of
+    // individual keys) can be applied before the final join. Tokens never contain
+    // a comma, so this round-trips the builder's output exactly.
+    let base = b.finish();
+    let mut parts: Vec<String> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split(',').map(str::to_string).collect()
+    };
+    enforce_nfs_safe_options(&mut parts);
+    parts.join(",")
+}
+
+/// Apply the NFS safety floor to an already-rendered option token list, in place.
+/// The floor *values* are NFS grammar owned here; the *mechanism* (skip when an
+/// explicit `hard` opt-out is present, else add each absent default) is core's
+/// generic [`apply_option_floor`]. An explicit `hard` is respected (operator
+/// override) and left untouched; otherwise `soft`/`softreval`/`timeo=50`/
+/// `retrans=2` are added when absent.
+fn enforce_nfs_safe_options(parts: &mut Vec<String>) {
+    apply_option_floor(
+        parts,
+        &[
+            ("soft", "soft"),
+            ("softreval", "softreval"),
+            ("timeo", "timeo=50"),
+            ("retrans", "retrans=2"),
+        ],
+        &["hard"],
+    );
 }
 
 /// Bounds-check a transfer size (`rsize`/`wsize`).
@@ -1515,12 +1550,16 @@ impl StorageBackend for NfsBackend {
         MountStyle::KernelMount
     }
 
-    /// Parse + validate an nfs mount spec into a typed [`OptionSet::Nfs`],
+    /// Parse + validate an nfs mount spec into a local typed [`NfsOptions`],
     /// rejecting malformed or conflicting options (bad `vers`, `hard`+`soft`,
     /// out-of-range numerics) at declare time. The source (and any failover
     /// sources) are normalized to canonical `host:/export` form.
     async fn validate_spec(&self, spec: &MountSpec) -> Result<NormalizedSpec, StorageError> {
-        let options = parse_nfs_options(spec.options.as_deref())?;
+        // Parse + validate locally, then render (with the safety floor) into the
+        // opaque `OptionSet::Raw` string core carries. Core neither parses nor
+        // renders nfs grammar — the plugin owns it end to end.
+        let parsed = parse_nfs_options(spec.options.as_deref())?;
+        let rendered = render_nfs_options(&parsed);
         let source = normalize_nfs_source(&spec.source)?;
         let failover_sources = spec
             .failover_sources
@@ -1533,18 +1572,41 @@ impl StorageBackend for NfsBackend {
             fstype: spec.fstype.clone(),
             source,
             failover_sources,
-            options,
+            options: OptionSet::Raw {
+                options: Some(rendered),
+            },
             credential: spec.credential.clone(),
+            secret_file: None,
             remount_policy: spec.remount_policy.clone(),
             enabled: spec.enabled,
         })
     }
 
     /// Emit the canonical comma-separated nfs option string autofs's `-fstype`
-    /// line consumes. Delegates to the storage domain's canonical renderer so the
-    /// grammar has a single source of truth and round-trips with `validate_spec`.
+    /// line / `mount -o` consumes — including the NFS safety floor. Core is
+    /// fstype-agnostic: it hands this method an `OptionSet::Raw` holding either the
+    /// declared option string (the autofs map path renders straight from the raw
+    /// store) or the already-rendered string from `validate_spec`. Either way the
+    /// plugin re-parses and renders, so the floor is always applied and the output
+    /// is idempotent under a second render.
     fn render_options(&self, spec: &NormalizedSpec) -> String {
-        render_option_set(&spec.options)
+        let OptionSet::Raw { options } = &spec.options;
+        match parse_nfs_options(options.as_deref()) {
+            Ok(parsed) => render_nfs_options(&parsed),
+            // A string that no longer parses (unexpected) falls back to verbatim so
+            // rendering never panics; validate_spec already rejected bad options.
+            Err(_) => options.clone().unwrap_or_default(),
+        }
+    }
+
+    fn net_fstypes(&self) -> Vec<String> {
+        vec!["nfs4".to_string(), "nfs".to_string()]
+    }
+
+    /// The NFS transport port core probes for source liveness. Core holds no
+    /// port literal — it asks the fstype's owning backend, which is nfs here.
+    fn default_source_port(&self) -> Option<u16> {
+        Some(2049)
     }
 
     async fn list_shares(&self) -> Result<Vec<Share>, StorageError> {
@@ -2298,32 +2360,71 @@ rootfs: local-lvm:vm-113-disk-0,size=8G
             "vers=4.2,hard,timeo=600,retrans=2,actimeo=30,rsize=1048576,wsize=1048576,_netdev,nofail,nconnect=4",
         ))
         .unwrap();
-        match set {
-            OptionSet::Nfs {
-                vers,
-                hard,
-                soft,
-                timeo,
-                retrans,
-                actimeo,
-                rsize,
-                wsize,
-                netdev,
-                extra,
-            } => {
-                assert_eq!(vers.as_deref(), Some("4.2"));
-                assert_eq!(hard, Some(true));
-                assert_eq!(soft, None);
-                assert_eq!(timeo, Some(600));
-                assert_eq!(retrans, Some(2));
-                assert_eq!(actimeo, Some(30));
-                assert_eq!(rsize, Some(1048576));
-                assert_eq!(wsize, Some(1048576));
-                assert!(netdev);
-                assert_eq!(extra, vec!["nofail".to_string(), "nconnect=4".to_string()]);
-            }
-            other => panic!("expected OptionSet::Nfs, got {other:?}"),
-        }
+        let NfsOptions {
+            vers,
+            hard,
+            soft,
+            timeo,
+            retrans,
+            actimeo,
+            rsize,
+            wsize,
+            netdev,
+            extra,
+        } = set;
+        assert_eq!(vers.as_deref(), Some("4.2"));
+        assert_eq!(hard, Some(true));
+        assert_eq!(soft, None);
+        assert_eq!(timeo, Some(600));
+        assert_eq!(retrans, Some(2));
+        assert_eq!(actimeo, Some(30));
+        assert_eq!(rsize, Some(1048576));
+        assert_eq!(wsize, Some(1048576));
+        assert!(netdev);
+        assert_eq!(extra, vec!["nofail".to_string(), "nconnect=4".to_string()]);
+    }
+
+    // ── nfs safety floor (moved from core autofs::enforce_nfs_safe_options) ──
+
+    fn render_raw(raw: &str) -> String {
+        render_nfs_options(&parse_nfs_options(Some(raw)).unwrap())
+    }
+    fn opts_set(s: &str) -> std::collections::HashSet<String> {
+        s.split(',').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn nfs_no_soft_or_hard_gets_full_soft_floor() {
+        let set = opts_set(&render_raw("vers=4.2"));
+        assert!(set.contains("vers=4.2"));
+        assert!(set.contains("soft"));
+        assert!(set.contains("softreval"));
+        assert!(set.contains("timeo=50"));
+        assert!(set.contains("retrans=2"));
+    }
+
+    #[test]
+    fn nfs_empty_options_still_gets_floor() {
+        let set = opts_set(&render_nfs_options(&parse_nfs_options(None).unwrap()));
+        assert!(set.contains("soft") && set.contains("timeo=50") && set.contains("retrans=2"));
+    }
+
+    #[test]
+    fn nfs_explicit_hard_is_left_untouched() {
+        let out = render_raw("vers=4.2,hard");
+        assert_eq!(out, "vers=4.2,hard");
+        assert!(!out.contains("soft"));
+    }
+
+    #[test]
+    fn nfs_existing_values_are_not_duplicated_or_overridden() {
+        let out = render_raw("soft,timeo=100,nconnect=4");
+        let set = opts_set(&out);
+        assert!(set.contains("timeo=100"));
+        assert!(!out.contains("timeo=50"));
+        assert!(set.contains("nconnect=4"));
+        assert!(set.contains("retrans=2"));
+        assert_eq!(out.matches("soft").count(), 2); // "soft" + "softreval"
     }
 
     #[test]
