@@ -1297,9 +1297,9 @@ fn parse_num(key: &str, value: &str) -> Result<u32, StorageError> {
 }
 
 /// The nfs backend's local typed option model. Core never sees this — it holds
-/// only the rendered `OptionSet::Raw` string. Mirrors the fields the core
-/// `OptionSet::Nfs` variant used to carry, so parsing/rendering is byte-identical
-/// to core's prior behavior.
+/// only the rendered `OptionSet::Raw` string. This backend owns the full NFS
+/// option grammar: the fields below are the ones it parses, validates, and
+/// renders.
 #[derive(Debug, Clone, PartialEq)]
 struct NfsOptions {
     vers: Option<String>,
@@ -1423,10 +1423,8 @@ fn parse_nfs_options(raw: Option<&str>) -> Result<NfsOptions, StorageError> {
 }
 
 /// Render a typed [`NfsOptions`] into the canonical comma-joined nfs option
-/// string, applying the resilient-default **safety floor** first. This replicates
-/// core's former `render_option_set(OptionSet::Nfs)` byte-for-byte, then layers
-/// the floor `enforce_nfs_safe_options` used to apply in core's autofs renderer —
-/// so migrating the grammar into the plugin changes no rendered output.
+/// string, applying the resilient-default **safety floor** first. This backend
+/// owns both the grammar and the floor.
 ///
 /// Safety floor: an NFS mount that declares neither `soft` nor `hard` inherits the
 /// kernel default of `hard`, which — when the server reboots — puts every process
@@ -1866,11 +1864,11 @@ proc /proc proc defaults 0 0
 
     #[tokio::test]
     async fn check_health_returns_stale_for_missing_path() {
-        // New contract (nfs#16): health probing delegates to the storage domain's
-        // `probe_health`, which maps a missing path to `Health::Missing`. A failed
-        // automount that fell through to a bare/absent dir must reach the recovery
-        // path, so `check_health` collapses Missing → "stale" (it used to `stat`
-        // and return "error: …", which never triggered remount).
+        // Health probing delegates to the storage domain's `probe_health`, which
+        // maps a missing path to `Health::Missing`. A failed automount that fell
+        // through to a bare/absent dir must reach the recovery path, so
+        // `check_health` collapses Missing → "stale" so remount fires (regression
+        // guard: a bare `stat` returning "error: …" never triggered remount).
         let s = check_health("/definitely/not/here/orca_nfs_test", Duration::from_secs(5)).await;
         assert_eq!(s, "stale");
     }
@@ -1905,12 +1903,11 @@ proc /proc proc defaults 0 0
         assert!(s == "stale" || s == "ok");
     }
 
-    // New contract (nfs#16): `read_mounts` no longer reads `/proc/mounts`
-    // directly — it delegates to the storage domain's cross-platform
-    // `mount_table_of` (`/proc/mounts` on Linux, `/sbin/mount` on macOS). So the
-    // read path SUCCEEDS off-Linux instead of erroring, and `list`/`release`
-    // ride that success. Exercised on non-Linux so those paths keep coverage in
-    // CI runners that aren't Linux.
+    // `read_mounts` delegates to the storage domain's cross-platform
+    // `mount_table_of` (`/proc/mounts` on Linux, `/sbin/mount` on macOS), so the
+    // read path succeeds off-Linux and `list`/`release` ride that success.
+    // Exercised on non-Linux so those paths keep coverage in CI runners that
+    // aren't Linux.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn read_mounts_reads_cross_platform() {
