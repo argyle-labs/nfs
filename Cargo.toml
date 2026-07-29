@@ -10,8 +10,9 @@ category = "storage"
 [lib]
 name = "nfs"
 path = "src/lib.rs"
-# `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it
-# as a normal Rust lib.
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it as
+# a normal Rust lib. The runnable plugin is the `[[bin]]` below — nfs runs as a
+# subprocess over the orca socket.
 crate-type = ["rlib"]
 
 [[bin]]
@@ -19,15 +20,17 @@ name = "nfs"
 path = "src/main.rs"
 
 # nfs is a BACKEND-ONLY orca plugin: it carries zero `#[orca_tool]`s and instead
-# registers a `storage` StorageBackend across the cdylib FFI seam. Per
+# registers a `storage` StorageBackend, served as a subprocess `[[bin]]` over the
+# orca socket (`plugin_toolkit::serve_storage_plugin!`). Per
 # [[feedback-plugin-toolkit-only-no-exceptions]] it reaches the whole orca
 # system — infra AND the `storage` domain (`plugin_toolkit::storage`) — through
 # `plugin-toolkit` alone.
 #
-# The typed mount contract this plugin implements — StorageBackend::validate_spec
-# / render_options / mount_style plus MountSpec / NormalizedSpec / OptionSet::Nfs
-# / SecretRef / register_from_def_styled — landed on orca `main` via PR #121, so
-# the dep points back at the git source rather than a local checkout.
+# The typed mount contract it implements (StorageBackend::validate_spec /
+# render_options / mount_style, MountSpec / NormalizedSpec / SecretRef /
+# register_from_def_styled) is reached through `plugin-toolkit`. This backend
+# owns its own NFS option grammar and hands core only the opaque `OptionSet::Raw`
+# string (core is fstype-agnostic; NFS never materializes a `SecretFile`).
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.1-rc.47" }
 
