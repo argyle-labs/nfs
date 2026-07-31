@@ -78,7 +78,7 @@ fn tool_error_to_io(e: &ToolError) -> std::io::Error {
     std::io::Error::other(format!("exit {:?}: {}", e.code, e.stderr))
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub device: String,
@@ -88,7 +88,7 @@ pub struct Mount {
     pub health: Option<String>,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone)]
 pub struct ReleaseResult {
     pub released: Vec<String>,
@@ -96,7 +96,7 @@ pub struct ReleaseResult {
     pub failed: Vec<ReleaseFailure>,
 }
 
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone)]
 pub struct ReleaseFailure {
     pub mountpoint: String,
@@ -108,7 +108,7 @@ pub struct ReleaseFailure {
 /// and `ok` after; `still_stale` are mounts that did not come back; `errors`
 /// captures any non-fatal step failures (release failures, mount -a failure)
 /// so the caller can log them and continue.
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone, Default)]
 pub struct RecoverResult {
     /// Mountpoints that were stale on the first probe and healthy after recovery.
@@ -186,7 +186,7 @@ pub fn parse_mounts<R: Read>(r: R) -> Result<Vec<Mount>, NfsError> {
 /// A network-filesystem entry declared in `/etc/fstab`. Captures whether the
 /// entry is managed by `x-systemd.automount` — those need the failed automount
 /// unit reset before a remount will take, which a bare `mount -a` does not do.
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FstabEntry {
     pub device: String,
@@ -765,7 +765,7 @@ fn path_under_watch(path: &str, watch: &[String]) -> bool {
 
 /// Structured outcome of [`recover_stale_consumers`], mirroring [`RecoverResult`]:
 /// consumers are categorized so the caller can log and continue.
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone, Default)]
 pub struct ConsumerRecoverResult {
     /// Containers whose bind ROOT probed healthy — nothing to do.
