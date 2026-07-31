@@ -12,6 +12,23 @@
     </pattern>
   </defs>
   <g clip-path="url(#tile)"><rect x="16" y="16" width="480" height="480" fill="url(#argyle)"/></g>
-  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2BD3D3" stroke-width="6"/>
-  <g fill="#7CA0C8"><rect x="150" y="168" width="212" height="60" rx="12"/><rect x="150" y="240" width="212" height="60" rx="12" opacity="0.85"/><circle cx="186" cy="198" r="9" fill="#0A1018"/><circle cx="186" cy="270" r="9" fill="#0A1018"/><g fill="none" stroke="#7CA0C8" stroke-width="12" stroke-linecap="round"><path d="M210 330 q46 -34 92 0"/><path d="M236 352 q20 -16 40 0"/></g><circle cx="256" cy="362" r="7" fill="#7CA0C8"/></g>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#7CA0C8" stroke-width="6"/>
+
+  <!-- networked file share: a folder with a share-node glyph -->
+  <g stroke="#0A1018" stroke-width="7" stroke-linejoin="round">
+    <path d="M148 188 Q148 174 162 174 L226 174 Q235 174 240 182 L252 198 L350 198
+             Q364 198 364 212 L364 348 Q364 362 350 362 L162 362 Q148 362 148 348 Z"
+          fill="#6E93BC"/>
+    <path d="M148 226 L364 226 L364 348 Q364 362 350 362 L162 362 Q148 362 148 348 Z"
+          fill="#A9C5E1"/>
+  </g>
+  <g stroke="#0A1018" stroke-width="10" stroke-linecap="round">
+    <line x1="226" y1="300" x2="292" y2="268"/>
+    <line x1="226" y1="300" x2="292" y2="332"/>
+  </g>
+  <g fill="#26527C" stroke="#0A1018" stroke-width="7">
+    <circle cx="222" cy="300" r="19"/>
+    <circle cx="298" cy="266" r="19"/>
+    <circle cx="298" cy="334" r="19"/>
+  </g>
 </svg>
