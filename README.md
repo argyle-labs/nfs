@@ -23,5 +23,5 @@ orca drives this plugin through its generic surface — rich, nfs-specific data 
 
 ## Layout
 
-- `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + `configure` / `status`.
+- `src/` — the plugin (pure Rust): the `StorageBackend` implementation — `mount` / `unmount` plus the stale-mount self-heal (`recover_stale`, which force-releases dead handles, replays `mount -a`, and re-probes).
 - `assets/` — plugin icon.
