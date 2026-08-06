@@ -86,6 +86,47 @@ pub struct Mount {
     pub fstype: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<String>,
+    /// How many mounts are stacked on this mountpoint. `1` is the normal case.
+    ///
+    /// Linux lets a mount be layered over an already-occupied mountpoint; only
+    /// the topmost is reachable by path. A single `umount` pops one layer and
+    /// *reveals the one beneath*, so a mountpoint can probe healthy right after
+    /// a repair and go stale again once that top layer is released — the
+    /// "I fixed it and it broke again on its own" symptom.
+    ///
+    /// Anything `> 1` means a previous release/remount cycle stacked instead of
+    /// replacing, and the mountpoint needs draining ([`release`] loops).
+    #[serde(default = "one_layer")]
+    pub layers: u32,
+}
+
+fn one_layer() -> u32 {
+    1
+}
+
+/// Collapse stacked mounts into one entry per mountpoint, carrying the layer
+/// count. Keeps the **topmost** mount's device/fstype, since that is what a
+/// path lookup actually resolves to; the kernel mount table is ordered
+/// oldest-first, so the last entry for a mountpoint is the top of the stack.
+pub fn collapse_layers(mounts: Vec<Mount>) -> Vec<Mount> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_mp: std::collections::HashMap<String, Mount> = std::collections::HashMap::new();
+    for m in mounts {
+        match by_mp.get_mut(&m.mountpoint) {
+            Some(existing) => {
+                let layers = existing.layers + 1;
+                *existing = Mount { layers, ..m };
+            }
+            None => {
+                order.push(m.mountpoint.clone());
+                by_mp.insert(m.mountpoint.clone(), m);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|mp| by_mp.remove(&mp))
+        .collect()
 }
 
 #[orca_struct]
@@ -94,6 +135,18 @@ pub struct ReleaseResult {
     pub released: Vec<String>,
     pub skipped: Vec<String>,
     pub failed: Vec<ReleaseFailure>,
+    /// Per-mountpoint count of stacked layers actually unmounted. A count `> 1`
+    /// means the mountpoint was stacked and a single `umount` would have left a
+    /// stale layer exposed underneath.
+    #[serde(default)]
+    pub layers_released: Vec<MountLayers>,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountLayers {
+    pub mountpoint: String,
+    pub layers: u32,
 }
 
 #[orca_struct]
@@ -127,6 +180,16 @@ pub struct RecoverResult {
     pub remounted: Vec<String>,
     /// Declared-but-absent mountpoints that could not be remounted.
     pub still_missing: Vec<String>,
+    /// Stale mountpoints **left alone** because nothing in `/etc/fstab`
+    /// declares them.
+    ///
+    /// Recovery is force-release then `mount -a`, and `mount -a` only knows
+    /// about fstab. Releasing a mount fstab does not declare converts a
+    /// *degraded* mountpoint into an *absent* one with no way back — strictly
+    /// worse, and not self-healing. Reported so an operator can add an fstab
+    /// entry or remount by hand.
+    #[serde(default)]
+    pub unmanaged: Vec<String>,
     /// Consumer-aware bind-mount recovery outcome (Part B). Populated only when
     /// the host sweep left the host healthy and a container runtime was supplied;
     /// `None` when the consumer sweep did not run (host-only recovery). See
@@ -155,6 +218,7 @@ pub fn read_mounts() -> Result<Vec<Mount>, NfsError> {
             mountpoint: e.mountpoint,
             fstype: e.fstype,
             health: None,
+            layers: 1,
         })
         .collect())
 }
@@ -178,6 +242,7 @@ pub fn parse_mounts<R: Read>(r: R) -> Result<Vec<Mount>, NfsError> {
             mountpoint: mountpoint.to_string(),
             fstype: fstype.to_string(),
             health: None,
+            layers: 1,
         });
     }
     Ok(out)
@@ -363,7 +428,10 @@ pub async fn list(
     fstype_filter: &str,
     health_timeout: Duration,
 ) -> Result<Vec<Mount>, NfsError> {
-    let mut mounts = filter_by_fstype(filter_watch(read_mounts()?, watch), fstype_filter);
+    let mut mounts = collapse_layers(filter_by_fstype(
+        filter_watch(read_mounts()?, watch),
+        fstype_filter,
+    ));
     let probes = mounts.iter().map(|m| {
         let mp = m.mountpoint.clone();
         async move { check_health(&mp, health_timeout).await }
@@ -400,28 +468,31 @@ pub async fn release(
             targets.push(m.mountpoint);
         }
     }
+    // Deduplicate: a stacked mountpoint appears once per layer in the mount
+    // table. One umount task per entry would race several `umount` processes
+    // against the same path concurrently. Drain each mountpoint once instead.
+    targets.sort();
+    targets.dedup();
+
     let umount_flag = if force { "-lf" } else { "-l" };
-    let attempts = targets.into_iter().map(|mp| async move {
-        let res = Command::new("umount")
-            .arg(umount_flag)
-            .arg(&mp)
-            .output()
-            .await
-            .map(|o| o.status);
-        (mp, res)
-    });
+    let attempts = targets
+        .into_iter()
+        .map(|mp| drain_mountpoint(mp, umount_flag));
     let mut released = Vec::new();
     let mut failed = Vec::new();
-    for (mp, res) in plugin_toolkit::reactor::join_all(attempts).await {
+    let mut layers_released = Vec::new();
+    for (mp, layers, res) in plugin_toolkit::reactor::join_all(attempts).await {
+        if layers > 0 {
+            layers_released.push(MountLayers {
+                mountpoint: mp.clone(),
+                layers,
+            });
+        }
         match res {
-            Ok(status) if status.success => released.push(mp),
-            Ok(status) => failed.push(ReleaseFailure {
+            Ok(()) => released.push(mp),
+            Err(error) => failed.push(ReleaseFailure {
                 mountpoint: mp,
-                error: format!("exit code {:?}", status.code),
-            }),
-            Err(e) => failed.push(ReleaseFailure {
-                mountpoint: mp,
-                error: e.to_string(),
+                error,
             }),
         }
     }
@@ -429,7 +500,59 @@ pub async fn release(
         released,
         skipped,
         failed,
+        layers_released,
     })
+}
+
+/// Upper bound on unmount iterations for a single mountpoint. A stack deeper
+/// than this means something is actively re-mounting underneath us; report
+/// rather than spin forever.
+const MAX_UNMOUNT_LAYERS: u32 = 16;
+
+/// Unmount one mountpoint until it no longer appears in the kernel mount table.
+///
+/// A single `umount` pops exactly one layer. When a mountpoint has been stacked
+/// — the usual outcome of a naive "umount then mount" repair, because `umount -l`
+/// returns before the mount is actually detached — popping one layer exposes the
+/// stale layer beneath, and the path reads healthy only until that top layer
+/// goes away. Loop until the mountpoint is genuinely absent.
+///
+/// Returns `(mountpoint, layers_popped, outcome)`; `layers_popped` is reported
+/// even on failure so a partial drain stays visible.
+async fn drain_mountpoint(mp: String, umount_flag: &str) -> (String, u32, Result<(), String>) {
+    let mut popped = 0u32;
+    loop {
+        // Re-read the mount table each pass. This is the authoritative answer to
+        // "is anything still mounted here", and it terminates the loop without
+        // trusting umount's exit code to mean "nothing left".
+        let still_mounted = match read_mounts() {
+            Ok(mounts) => mounts.iter().any(|m| m.mountpoint == mp),
+            Err(e) => return (mp, popped, Err(format!("re-read mount table: {e}"))),
+        };
+        if !still_mounted {
+            return (mp, popped, Ok(()));
+        }
+        if popped >= MAX_UNMOUNT_LAYERS {
+            return (
+                mp,
+                popped,
+                Err(format!(
+                    "still mounted after draining {MAX_UNMOUNT_LAYERS} layers; \
+                     something is re-mounting underneath"
+                )),
+            );
+        }
+        match Command::new("umount")
+            .arg(umount_flag)
+            .arg(&mp)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success => popped += 1,
+            Ok(o) => return (mp, popped, Err(format!("exit code {:?}", o.status.code))),
+            Err(e) => return (mp, popped, Err(e.to_string())),
+        }
+    }
 }
 
 /// `mount -a` — (re)mount everything declared in fstab that isn't already
@@ -496,14 +619,36 @@ pub async fn recover_stale(
 
     // 1. Probe health of everything now in the mount table.
     let mounts = list(watch, fstype_filter, health_timeout).await?;
-    let stale: Vec<Mount> = mounts
+    let mut stale: Vec<Mount> = mounts
         .into_iter()
         .filter(|m| m.health.as_deref() == Some("stale"))
         .collect();
 
+    // 2. Withhold stale mounts fstab does not declare. Step 4 restores via
+    //    `mount -a`, which only knows fstab, so releasing an undeclared mount
+    //    would detach it permanently. Degraded beats gone. An unreadable fstab
+    //    means nothing is treated as declared — the conservative direction.
+    let declared = read_fstab().unwrap_or_default();
+    let (managed, unmanaged): (Vec<Mount>, Vec<Mount>) = stale
+        .drain(..)
+        .partition(|m| declared.iter().any(|e| e.mountpoint == m.mountpoint));
+    for m in &unmanaged {
+        result.unmanaged.push(m.mountpoint.clone());
+        result.errors.push(format!(
+            "{}: stale but not declared in {FSTAB}; refusing to release \
+             (mount -a could not restore it)",
+            m.mountpoint
+        ));
+    }
+    let stale = managed;
+
     if stale.is_empty() {
-        // No-op only if there was also nothing missing to remount.
-        result.no_stale_found = result.remounted.is_empty() && result.still_missing.is_empty();
+        // No-op only if there was nothing missing to remount and nothing
+        // withheld as unmanaged — a withheld stale mount is a real finding,
+        // not a clean bill of health.
+        result.no_stale_found = result.remounted.is_empty()
+            && result.still_missing.is_empty()
+            && result.unmanaged.is_empty();
         return Ok(result);
     }
 
@@ -1771,6 +1916,7 @@ proc /proc proc defaults 0 0
             mountpoint: "/mnt/data/sub".into(),
             fstype: "nfs".into(),
             health: None,
+            layers: 1,
         });
         let watch = vec!["/mnt/data".to_string()];
         let filtered = filter_watch(mounts, &watch);
@@ -1827,6 +1973,7 @@ proc /proc proc defaults 0 0
             mountpoint: "/mnt/x".into(),
             fstype: "nfs4".into(),
             health: Some("ok".into()),
+            layers: 1,
         };
         let s = serde_json::to_string(&m).unwrap();
         let back: Mount = serde_json::from_str(&s).unwrap();
@@ -1847,6 +1994,7 @@ proc /proc proc defaults 0 0
                 mountpoint: "/c".into(),
                 error: "x".into(),
             }],
+            layers_released: vec![],
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ReleaseResult = serde_json::from_str(&s).unwrap();
@@ -1942,6 +2090,157 @@ proc /proc proc defaults 0 0
         assert!(res.is_ok());
     }
 
+    // ── regression: stacked mounts ──────────────────────────────────────────
+    // `umount -l` returns before the mount is detached, so a following `mount`
+    // layers on top instead of replacing. Only the topmost layer is reachable
+    // by path, so a repair probes healthy and then "spontaneously" breaks again
+    // once that layer is released and the dead one beneath is revealed.
+
+    const STACKED: &str = "\
+<ip>:/export/data /mnt/data nfs4 rw 0 0
+<ip>:/export/data /mnt/data nfs4 rw 0 0
+<ip>:/export/backups /mnt/backups nfs4 rw 0 0
+";
+
+    #[test]
+    fn collapse_layers_counts_stacked_mounts() {
+        let collapsed = collapse_layers(parse_mounts(STACKED.as_bytes()).unwrap());
+        assert_eq!(collapsed.len(), 2, "one entry per mountpoint");
+        let data = collapsed
+            .iter()
+            .find(|m| m.mountpoint == "/mnt/data")
+            .unwrap();
+        assert_eq!(data.layers, 2, "two mounts stacked on /mnt/data");
+        let backups = collapsed
+            .iter()
+            .find(|m| m.mountpoint == "/mnt/backups")
+            .unwrap();
+        assert_eq!(backups.layers, 1);
+    }
+
+    #[test]
+    fn collapse_layers_preserves_first_seen_order() {
+        let collapsed = collapse_layers(parse_mounts(STACKED.as_bytes()).unwrap());
+        assert_eq!(collapsed[0].mountpoint, "/mnt/data");
+        assert_eq!(collapsed[1].mountpoint, "/mnt/backups");
+    }
+
+    #[test]
+    fn collapse_layers_keeps_topmost_device() {
+        // The mount table is oldest-first, so the *last* entry for a mountpoint
+        // is what a path lookup resolves to.
+        let raw = "\
+old:/export /mnt/x nfs4 rw 0 0
+new:/export /mnt/x nfs4 rw 0 0
+";
+        let collapsed = collapse_layers(parse_mounts(raw.as_bytes()).unwrap());
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].device, "new:/export");
+        assert_eq!(collapsed[0].layers, 2);
+    }
+
+    #[test]
+    fn collapse_layers_is_identity_for_unstacked() {
+        let mounts = parse_mounts(SAMPLE.as_bytes()).unwrap();
+        let n = mounts.len();
+        let collapsed = collapse_layers(mounts);
+        assert_eq!(collapsed.len(), n);
+        assert!(collapsed.iter().all(|m| m.layers == 1));
+    }
+
+    #[test]
+    fn mount_layers_round_trips_through_serde() {
+        let r = ReleaseResult {
+            released: vec!["/mnt/data".into()],
+            skipped: vec![],
+            failed: vec![],
+            layers_released: vec![MountLayers {
+                mountpoint: "/mnt/data".into(),
+                layers: 2,
+            }],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: ReleaseResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.layers_released[0].layers, 2);
+        assert_eq!(back.layers_released[0].mountpoint, "/mnt/data");
+    }
+
+    #[test]
+    fn mount_layers_defaults_to_one_when_absent_from_json() {
+        // Payloads that predate the field must deserialize as unstacked, not 0.
+        let m: Mount =
+            serde_json::from_str(r#"{"device":"s:/x","mountpoint":"/mnt/x","fstype":"nfs4"}"#)
+                .unwrap();
+        assert_eq!(m.layers, 1);
+    }
+
+    // ── regression: unmanaged mounts must not be released ───────────────────
+    // Recovery restores via `mount -a`, which only knows fstab. Releasing a
+    // mount fstab does not declare detaches it permanently.
+
+    #[test]
+    fn recover_result_tracks_unmanaged_mounts() {
+        let r = RecoverResult {
+            unmanaged: vec!["/mnt/data".into()],
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: RecoverResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.unmanaged, vec!["/mnt/data".to_string()]);
+    }
+
+    #[test]
+    fn unmanaged_partition_withholds_mounts_absent_from_fstab() {
+        // The guard in recover_stale: a stale mount is releasable only when
+        // fstab declares its mountpoint.
+        let declared = parse_fstab(SAMPLE_FSTAB.as_bytes()).unwrap();
+        let stale = vec![
+            Mount {
+                device: "<ip>:/srv/pool/data".into(),
+                mountpoint: "/mnt/<pool>/data".into(),
+                fstype: "nfs4".into(),
+                health: Some("stale".into()),
+                layers: 1,
+            },
+            Mount {
+                device: "<ip>:/export/data".into(),
+                mountpoint: "/mnt/data".into(),
+                fstype: "nfs4".into(),
+                health: Some("stale".into()),
+                layers: 1,
+            },
+        ];
+        let (managed, unmanaged): (Vec<Mount>, Vec<Mount>) = stale
+            .into_iter()
+            .partition(|m| declared.iter().any(|e| e.mountpoint == m.mountpoint));
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].mountpoint, "/mnt/<pool>/data");
+        assert_eq!(unmanaged.len(), 1);
+        assert_eq!(
+            unmanaged[0].mountpoint, "/mnt/data",
+            "ad-hoc mount absent from fstab must be withheld from release"
+        );
+    }
+
+    #[test]
+    fn unreadable_fstab_withholds_everything() {
+        // `read_fstab().unwrap_or_default()` yields no declarations, so every
+        // stale mount partitions as unmanaged — the conservative direction.
+        let declared: Vec<FstabEntry> = Vec::new();
+        let stale = vec![Mount {
+            device: "srv:/x".into(),
+            mountpoint: "/mnt/x".into(),
+            fstype: "nfs4".into(),
+            health: Some("stale".into()),
+            layers: 1,
+        }];
+        let (managed, unmanaged): (Vec<Mount>, Vec<Mount>) = stale
+            .into_iter()
+            .partition(|m| declared.iter().any(|e| e.mountpoint == m.mountpoint));
+        assert!(managed.is_empty());
+        assert_eq!(unmanaged.len(), 1);
+    }
+
     #[test]
     fn recover_result_round_trips_through_serde() {
         let r = RecoverResult {
@@ -1951,6 +2250,7 @@ proc /proc proc defaults 0 0
             no_stale_found: false,
             remounted: vec!["/mnt/d".into()],
             still_missing: vec!["/mnt/e".into()],
+            unmanaged: vec![],
             consumers: None,
         };
         let s = serde_json::to_string(&r).unwrap();
@@ -2065,12 +2365,14 @@ rootfs: local-lvm:vm-113-disk-0,size=8G
                 mountpoint: "/mnt/pool".into(),
                 fstype: "nfs4".into(),
                 health: Some("ok".into()),
+                layers: 1,
             },
             Mount {
                 device: "srv:/pool/data".into(),
                 mountpoint: "/mnt/pool/data".into(),
                 fstype: "nfs4".into(),
                 health: Some("stale".into()),
+                layers: 1,
             },
         ];
         // Longest covering mount for this source is /mnt/pool/data (stale).
