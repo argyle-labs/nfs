@@ -11,9 +11,9 @@ use plugin_toolkit::orca_async;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::{Command, ToolError};
 use plugin_toolkit::storage::{
-    apply_option_floor, mount_table_of, parse_option_string, probe_health, Capability, Health,
-    MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionBuilder, OptionSet, RecoverOutcome,
-    Share, StorageBackend, StorageError, StorageKind,
+    apply_option_floor, mount_table_of, parse_option_string, probe_health, Capability, ExportEntry,
+    Health, MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionBuilder, OptionSet,
+    RecoverOutcome, Share, StorageBackend, StorageError, StorageKind,
 };
 
 /// Network filesystem types this crate reports on. Single source shared by the
@@ -21,6 +21,9 @@ use plugin_toolkit::storage::{
 /// ([`is_network_fs`]) so both agree on what counts as a network mount.
 const NETWORK_FSTYPES: &[&str] = &["nfs", "nfs4", "cifs", "smbfs"];
 const FSTAB: &str = "/etc/fstab";
+/// Static NFS server export table, read as the fallback when `exportfs -v`
+/// (the running server's live view) is unavailable.
+const EXPORTS: &str = "/etc/exports";
 
 #[derive(Debug)]
 pub enum NfsError {
@@ -297,6 +300,103 @@ pub fn parse_fstab<R: Read>(r: R) -> Result<Vec<FstabEntry>, NfsError> {
         });
     }
     Ok(out)
+}
+
+/// Read the NFS server exports this host publishes. Prefers the running
+/// server's authoritative view (`exportfs -v`, which resolves wildcards and
+/// fills `fsid=`); falls back to the static [`EXPORTS`] table when `exportfs`
+/// is absent or fails. A host that serves nothing (no `exportfs`, no
+/// `/etc/exports`) reports an empty list rather than an error — read-only and
+/// bounded so it stays cheap on non-server hosts.
+async fn read_exports() -> Result<Vec<ExportEntry>, StorageError> {
+    if let Ok(o) = Command::new("exportfs").arg("-v").output().await {
+        if o.status.success {
+            return Ok(parse_exports(&String::from_utf8_lossy(&o.stdout)));
+        }
+    }
+    match std::fs::read_to_string(EXPORTS) {
+        Ok(text) => Ok(parse_exports(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(StorageError::Transport(format!("read {EXPORTS}: {e}"))),
+    }
+}
+
+/// Parse `exportfs -v` (or `/etc/exports`) text into one [`ExportEntry`] per
+/// exported path. Both formats share a grammar: a whitespace-leading export
+/// path followed by zero or more `client(opt,opt,...)` specs. `exportfs -v`
+/// emits one client per line and repeats the path, so grouping by path folds
+/// those back together; `/etc/exports` lists every client on one line. `fsid=`
+/// is lifted into [`ExportEntry::fsid`] (and left in `options` as declared).
+/// Blank and `#`-comment lines are skipped. Pure so it's testable without a
+/// running NFS server.
+fn parse_exports(raw: &str) -> Vec<ExportEntry> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_path: std::collections::HashMap<String, ExportEntry> =
+        std::collections::HashMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut toks = line.split_whitespace();
+        let Some(path) = toks.next() else {
+            continue;
+        };
+        let entry = by_path.entry(path.to_string()).or_insert_with(|| {
+            order.push(path.to_string());
+            ExportEntry {
+                path: path.to_string(),
+                allowed_clients: Vec::new(),
+                options: Vec::new(),
+                fsid: None,
+            }
+        });
+        for spec in toks {
+            let (client, options) = parse_client_spec(spec);
+            // `exportfs -v` renders the everyone/`*` client as `<world>`;
+            // canonicalize back to `*` so both source formats agree.
+            let client = if client == "<world>" {
+                "*".to_string()
+            } else {
+                client
+            };
+            if !client.is_empty() && !entry.allowed_clients.contains(&client) {
+                entry.allowed_clients.push(client);
+            }
+            for o in options {
+                if let Some(id) = o.strip_prefix("fsid=") {
+                    if entry.fsid.is_none() {
+                        entry.fsid = Some(id.to_string());
+                    }
+                }
+                if !entry.options.contains(&o) {
+                    entry.options.push(o);
+                }
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|p| by_path.remove(&p))
+        .collect()
+}
+
+/// Split one `client(opt,opt,...)` export spec into its client and options. A
+/// bare `client` with no parenthesized options yields an empty option list; a
+/// leading `(opts)` with no client yields an empty client.
+fn parse_client_spec(spec: &str) -> (String, Vec<String>) {
+    match spec.split_once('(') {
+        Some((client, rest)) => {
+            let options = rest
+                .trim_end_matches(')')
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (client.trim().to_string(), options)
+        }
+        None => (spec.trim().to_string(), Vec::new()),
+    }
 }
 
 /// Expected network mounts (from fstab) that are **absent** from `/proc/mounts`.
@@ -1679,6 +1779,7 @@ impl StorageBackend for NfsBackend {
     fn capabilities(&self) -> Vec<Capability> {
         vec![
             Capability::List,
+            Capability::Exports,
             Capability::Unmount,
             Capability::RecoverStale,
         ]
@@ -1764,6 +1865,13 @@ impl StorageBackend for NfsBackend {
                 mounted: true,
             })
             .collect())
+    }
+
+    /// Enumerate the NFS exports this host serves (`storage.exports`). Reads the
+    /// running server's live view via `exportfs -v`, falling back to the static
+    /// `/etc/exports` table, and lifts `fsid=` per export. Read-only.
+    async fn list_exports(&self) -> Result<Vec<ExportEntry>, StorageError> {
+        read_exports().await
     }
 
     async fn unmount(&self, target: &str) -> Result<MountOutcome, StorageError> {
@@ -1860,6 +1968,47 @@ nasbox:/legacy /mnt/legacy smbfs ro 0 0
         assert_eq!(mounts[0].fstype, "nfs4");
         assert_eq!(mounts[1].mountpoint, "/mnt/host-e");
         assert_eq!(mounts[2].fstype, "smbfs");
+    }
+
+    // `exportfs -v` view: one client per line, path repeated, `<world>` for `*`.
+    const SAMPLE_EXPORTFS: &str = "\
+/srv/nfs/data \t10.10.10.0/24(sync,wdelay,hide,no_subtree_check,fsid=1,sec=sys,rw,secure,root_squash)
+/srv/nfs/data \t192.168.1.0/24(sync,wdelay,hide,no_subtree_check,fsid=1,sec=sys,ro,secure,root_squash)
+/srv/nfs/media \t<world>(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash)
+";
+
+    // `/etc/exports` view: all clients on one line, comments and blanks skipped.
+    const SAMPLE_ETC_EXPORTS: &str = "\
+# NFS exports
+/srv/nfs/data 10.10.10.0/24(rw,sync,no_subtree_check,fsid=1) 192.168.1.0/24(ro,sync)
+
+/srv/nfs/media *(ro,sync)
+";
+
+    #[test]
+    fn parse_exportfs_groups_clients_and_lifts_fsid() {
+        let exports = parse_exports(SAMPLE_EXPORTFS);
+        assert_eq!(exports.len(), 2);
+        let data = exports.iter().find(|e| e.path == "/srv/nfs/data").unwrap();
+        assert_eq!(data.allowed_clients, ["10.10.10.0/24", "192.168.1.0/24"]);
+        assert_eq!(data.fsid.as_deref(), Some("1"));
+        assert!(data.options.iter().any(|o| o == "rw"));
+        assert!(data.options.iter().any(|o| o == "ro"));
+        let media = exports.iter().find(|e| e.path == "/srv/nfs/media").unwrap();
+        // `<world>` canonicalizes back to `*`; no fsid declared.
+        assert_eq!(media.allowed_clients, ["*"]);
+        assert_eq!(media.fsid, None);
+    }
+
+    #[test]
+    fn parse_etc_exports_one_line_many_clients() {
+        let exports = parse_exports(SAMPLE_ETC_EXPORTS);
+        assert_eq!(exports.len(), 2);
+        let data = exports.iter().find(|e| e.path == "/srv/nfs/data").unwrap();
+        assert_eq!(data.allowed_clients, ["10.10.10.0/24", "192.168.1.0/24"]);
+        assert_eq!(data.fsid.as_deref(), Some("1"));
+        let media = exports.iter().find(|e| e.path == "/srv/nfs/media").unwrap();
+        assert_eq!(media.allowed_clients, ["*"]);
     }
 
     const SAMPLE_FSTAB: &str = "\
