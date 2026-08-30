@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 use std::time::Duration;
 
+use plugin_toolkit::mount_recover;
 use plugin_toolkit::orca_async;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::{Command, ToolError};
@@ -193,12 +194,12 @@ pub struct RecoverResult {
     /// entry or remount by hand.
     #[serde(default)]
     pub unmanaged: Vec<String>,
-    /// Consumer-aware bind-mount recovery outcome (Part B). Populated only when
-    /// the host sweep left the host healthy and a container runtime was supplied;
-    /// `None` when the consumer sweep did not run (host-only recovery). See
-    /// [`recover_stale_consumers`].
+    /// Consumer-aware bind-mount recovery outcome. Populated only when the host
+    /// sweep left the host healthy and a container runtime was supplied; `None`
+    /// when the consumer sweep did not run (host-only recovery). The consumer
+    /// machinery is the shared [`mount_recover`] module, not duplicated here.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub consumers: Option<ConsumerRecoverResult>,
+    pub consumers: Option<mount_recover::ConsumerRecoverResult>,
 }
 
 /// Is `fstype` one of the network filesystems this crate reports on?
@@ -485,25 +486,6 @@ pub fn filter_by_fstype(mounts: Vec<Mount>, fstype: &str) -> Vec<Mount> {
     mounts.into_iter().filter(|m| m.fstype == fstype).collect()
 }
 
-/// Classify a failed `stat` by its stderr. A stale NFS handle can fail two
-/// ways: the kernel *blocks* (detected by the caller's timeout → `"stale"`), or
-/// it fails *fast* with `ESTALE` — stderr `... Stale file handle`. The fast
-/// path is exactly the consumer-bind failure mode the original probe missed: it
-/// returned `"error: …"`, so the force-release/remount recovery never fired.
-/// Any other failure (ENOENT, EACCES, …) stays a plain `"error: …"`.
-///
-/// Returns the health string the probe should report (`"stale"` for ESTALE,
-/// otherwise `"error: <stderr>"`). Pure + case-insensitive so it's unit-testable
-/// without spawning `stat`.
-pub fn classify_stat_failure(stderr: &str) -> String {
-    let trimmed = stderr.trim();
-    if trimmed.to_ascii_lowercase().contains("stale file handle") {
-        "stale".to_string()
-    } else {
-        format!("error: {trimmed}")
-    }
-}
-
 /// Probe a mountpoint's liveness, returning `"ok"` / `"stale"` / `"error: …"`.
 ///
 /// Delegates to the storage domain's generic [`probe_health`] so the plugin and
@@ -785,117 +767,39 @@ pub async fn recover_stale(
     Ok(result)
 }
 
-/// Full self-heal: the host sweep ([`recover_stale`]) **followed by** the
-/// consumer-aware bind-mount sweep ([`recover_stale_consumers`]).
+/// Full self-heal across MANY container runtimes: the host sweep
+/// ([`recover_stale`]) runs ONCE, then the shared consumer-aware sweep restarts
+/// containers whose bind ROOT is stale **while the covering host mount is
+/// healthy** (host self-healed, container still pinning the old superblock) and
+/// starts stopped guests whose managed bind is now live. This is the entry point
+/// the storage `recover` verb drives so a host running both Docker and Proxmox
+/// heals guests under either — see nfs#16.
 ///
-/// This is the entry the periodic self-heal path uses. The consumer sweep runs
-/// *after* the host sweep so any host-level staleness is remediated first, then:
-///   * a per-bind-source host-health closure is derived from the *post-recovery*
-///     mount table (a source is healthy when its covering mount probes `ok`);
-///   * the consumer sweep restarts only those containers whose bind ROOT is
-///     ESTALE **while the covering host mount is healthy** — the exact incident
-///     signature (host self-healed, container still pinning the old superblock).
-///
-/// The guard means a host-wide outage (host mounts still stale) never triggers a
-/// container restart storm: `host_healthy(source)` returns `false` for a source
-/// whose mount is stale or absent, so those consumers are recorded as
-/// `skipped_host_stale` instead of restarted.
+/// The consumer machinery is the fstype-agnostic [`mount_recover`] module, shared
+/// with the `smb` backend rather than duplicated here. nfs supplies only the
+/// `host_healthy` closure, derived from its *post-recovery* mount table (a source
+/// is healthy when its longest covering network mount probes `ok`), so the shared
+/// guard never triggers a restart storm during a host-wide outage: a stale/absent
+/// source yields `false` and those consumers are recorded `skipped_host_stale`.
 ///
 /// A failure to read `/proc/mounts` during the host sweep is fatal (`Err`), same
-/// as [`recover_stale`]. The consumer sweep itself is best-effort and folds its
-/// own failures into `ConsumerRecoverResult::errors`.
-pub async fn recover_stale_with_consumers(
-    runtime: &dyn ContainerRuntime,
-    watch: &[String],
-    fstype_filter: &str,
-    health_timeout: Duration,
-) -> Result<RecoverResult, NfsError> {
-    let mut result = recover_stale(watch, fstype_filter, health_timeout).await?;
-
-    // Snapshot the post-recovery mount table once so the guard closure does not
-    // re-probe per consumer. A bind source is host-healthy when the longest
-    // covering network mount is present and stats `ok`.
-    let mounts = list(watch, fstype_filter, health_timeout).await?;
-    let host_healthy = |source: &str| host_source_healthy(source, &mounts);
-
-    let consumers = recover_stale_consumers(runtime, watch, health_timeout, host_healthy).await;
-    result.consumers = Some(consumers);
-    Ok(result)
-}
-
-/// Is `bin` on `PATH`? Used to pick which container runtimes to sweep — a host
-/// may run Docker, Proxmox (`pct`), both, or neither.
-async fn have_binary(bin: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {bin}"))
-        .output()
-        .await
-        .map(|o| o.status.success)
-        .unwrap_or(false)
-}
-
-/// Detect the container runtimes present on this host, in a stable order. Empty
-/// when neither Docker nor Proxmox is installed (recovery is then host-only).
-pub async fn detect_runtimes() -> Vec<Box<dyn ContainerRuntime>> {
-    let mut runtimes: Vec<Box<dyn ContainerRuntime>> = Vec::new();
-    if have_binary("docker").await {
-        runtimes.push(Box::new(DockerCli));
-    }
-    if have_binary("pct").await {
-        runtimes.push(Box::new(PctCli));
-    }
-    runtimes
-}
-
-/// Full self-heal across MANY container runtimes: the host sweep runs ONCE, then
-/// every supplied runtime's consumer sweep (stale-bind restart) and start-gate
-/// (stopped-guest auto-start) runs against the shared post-recovery host-health
-/// snapshot, folding all consumer outcomes into one [`ConsumerRecoverResult`].
-/// This is the entry point the storage `recover` verb drives so a host running
-/// both Docker and Proxmox heals guests under either — see nfs#16.
-///
-/// A single-runtime caller can still use [`recover_stale_with_consumers`]; this
-/// is its N-runtime generalization without repeating the host sweep per runtime.
+/// as [`recover_stale`]. The consumer sweep itself is best-effort.
 pub async fn recover_stale_multi(
-    runtimes: &[Box<dyn ContainerRuntime>],
+    runtimes: &[Box<dyn mount_recover::ContainerRuntime>],
     watch: &[String],
     fstype_filter: &str,
     health_timeout: Duration,
 ) -> Result<RecoverResult, NfsError> {
     let mut result = recover_stale(watch, fstype_filter, health_timeout).await?;
 
-    // One post-recovery snapshot shared by every runtime's guard (same as the
-    // single-runtime path), so N runtimes do not re-probe the host N times.
+    // One post-recovery snapshot shared by every runtime's guard, so N runtimes
+    // do not re-probe the host N times.
     let mounts = list(watch, fstype_filter, health_timeout).await?;
     let host_healthy = |source: &str| host_source_healthy(source, &mounts);
 
-    let mut merged = ConsumerRecoverResult {
-        no_consumers_found: true,
-        ..Default::default()
-    };
-    for rt in runtimes {
-        let c = recover_stale_consumers(rt.as_ref(), watch, health_timeout, &host_healthy).await;
-        if !c.no_consumers_found {
-            merged.no_consumers_found = false;
-        }
-        merged.healthy.extend(c.healthy);
-        merged.recovered.extend(c.recovered);
-        merged.skipped_host_stale.extend(c.skipped_host_stale);
-        merged.still_stale.extend(c.still_stale);
-        merged.errors.extend(c.errors);
-
-        // Hook replacement: start stopped guests whose managed bind's host mount
-        // is now healthy. Reported as `started:<name>` in `recovered`.
-        let started = rt.start_gated(watch, &host_healthy).await;
-        if !started.is_empty() {
-            merged.no_consumers_found = false;
-            merged
-                .recovered
-                .extend(started.into_iter().map(|n| format!("started:{n}")));
-        }
-    }
-    result.consumers = Some(merged);
+    let consumers =
+        mount_recover::recover_consumers_multi(runtimes, watch, health_timeout, host_healthy).await;
+    result.consumers = Some(consumers);
     Ok(result)
 }
 
@@ -913,87 +817,6 @@ fn host_source_healthy(source: &str, mounts: &[Mount]) -> bool {
         .unwrap_or(false)
 }
 
-// ── consumer-aware bind-mount staleness (Part B) ─────────────────────────────
-//
-// The host mount can self-heal (autofs re-triggers, a fresh superblock lands)
-// and the host-side `stat` probe reports healthy — yet a long-running container
-// that bind-mounted a subpath of the pool still pins the OLD superblock. Reading
-// the bind's ROOT inside that container returns ESTALE ("Stale file handle")
-// even though the host is fine; already-cached subdirs still stat OK, so the
-// staleness hides until a consumer walks the root. Restarting the container
-// re-binds the fresh mount and clears it.
-//
-// The host-side probe is structurally blind to this (the host WAS healthy), so
-// recovery needs a consumer-aware pass: enumerate containers bind-mounting a
-// watched host path, probe the bind ROOT *inside* each container, and — only
-// when the host mount is healthy but the consumer is ESTALE — restart that
-// consumer. Guarded so a host-wide outage never triggers a restart storm.
-
-/// One host→container bind of a watched path, as seen by the container runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConsumerBind {
-    /// Container id (runtime-native handle used for exec/restart).
-    pub container_id: String,
-    /// Human-friendly container name for reporting.
-    pub container_name: String,
-    /// The host path being bind-mounted (matches a watched prefix).
-    pub host_source: String,
-    /// The path the bind is mounted at *inside* the container — the ROOT we
-    /// probe for ESTALE.
-    pub container_target: String,
-}
-
-/// Result of a `stat` probe of a bind ROOT inside a container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsumerProbe {
-    Ok,
-    Stale,
-}
-
-/// Abstraction over the container runtime so the consumer sweep is testable
-/// without Docker. The production impl ([`DockerCli`]) shells `docker` behind
-/// this trait. The toolkit does expose a `containers` seam, but it pulls the
-/// bollard/Docker client the thin nfs plugin deliberately avoids, so the runtime
-/// is reached via `plugin_toolkit::process::Command` confined to this one
-/// swappable seam rather than scattered `Command::new("docker")` calls.
-#[orca_async]
-pub trait ContainerRuntime: Send + Sync {
-    /// Enumerate containers bind-mounting any host path under one of `watch`.
-    /// Same prefix semantics as [`filter_watch`] (`/foo` matches `/foo` and
-    /// `/foo/...`).
-    async fn binds_under(&self, watch: &[String]) -> Result<Vec<ConsumerBind>, NfsError>;
-
-    /// Probe `path` inside container `id` with a timeout. ESTALE (or a hang past
-    /// the budget) → [`ConsumerProbe::Stale`]; success → `Ok`. Any other failure
-    /// is surfaced as `Err` for the caller to record.
-    async fn probe_path(
-        &self,
-        id: &str,
-        path: &str,
-        timeout: Duration,
-    ) -> Result<ConsumerProbe, NfsError>;
-
-    /// Restart container `id` to re-bind the fresh mount.
-    async fn restart(&self, id: &str) -> Result<(), NfsError>;
-
-    /// Start any consumer that is currently STOPPED, declares a bind of a watched
-    /// host path, and whose covering host mount is healthy — the orca-owned
-    /// replacement for a host-local "refuse start until the mount is live" hook
-    /// that never retries (nfs#16, the frigg jellyfin-stopped-for-days incident).
-    /// `host_healthy(host_source)` gates the start exactly like the restart path,
-    /// so a host-wide outage never starts a fleet of guests against a dead mount.
-    /// Returns the names started. Runtimes with no notion of a stopped-but-
-    /// configured consumer — e.g. Docker, whose sweep only ever sees running
-    /// containers — keep the default no-op.
-    async fn start_gated(
-        &self,
-        _watch: &[String],
-        _host_healthy: &(dyn Fn(&str) -> bool + Sync),
-    ) -> Vec<String> {
-        Vec::new()
-    }
-}
-
 /// Does a host path fall under one of the watched prefixes? Shares prefix
 /// semantics with the mount-table [`filter_watch`] so consumer binds and host
 /// mounts match identically.
@@ -1006,474 +829,6 @@ fn path_under_watch(path: &str, watch: &[String]) -> bool {
         Some(rest) => rest.starts_with('/'),
         None => false,
     })
-}
-
-/// Structured outcome of [`recover_stale_consumers`], mirroring [`RecoverResult`]:
-/// consumers are categorized so the caller can log and continue.
-#[orca_struct]
-#[derive(Debug, Clone, Default)]
-pub struct ConsumerRecoverResult {
-    /// Containers whose bind ROOT probed healthy — nothing to do.
-    pub healthy: Vec<String>,
-    /// Containers that were ESTALE and were restarted back to health (host
-    /// mount healthy).
-    pub recovered: Vec<String>,
-    /// Containers that probed ESTALE but were NOT restarted because the host
-    /// mount for that path was itself stale (host-wide outage guard) — a restart
-    /// would not help and could storm.
-    pub skipped_host_stale: Vec<String>,
-    /// Containers restarted but still ESTALE afterwards, or whose restart failed.
-    pub still_stale: Vec<String>,
-    /// Non-fatal per-consumer errors (enumerate/probe/restart failures).
-    pub errors: Vec<String>,
-    /// `true` when no watched bind was found at all (fast path / no-op).
-    pub no_consumers_found: bool,
-}
-
-/// Consumer-aware bind-mount staleness detection + remediation.
-///
-/// 1. Enumerate containers bind-mounting any host path under `watch`.
-/// 2. Probe the bind ROOT inside each container for ESTALE.
-/// 3. If the *host* mount for that path is healthy but the consumer is ESTALE →
-///    stale bind → restart the consumer (re-binds the fresh superblock).
-/// 4. Re-probe restarted consumers and classify.
-///
-/// `host_healthy(host_source) -> bool` reports whether the host-side mount
-/// covering that bind source is currently healthy; the sweep only restarts when
-/// the host is healthy (never during a host-wide outage). Idempotent — a
-/// consumer already healthy is left alone.
-pub async fn recover_stale_consumers<F>(
-    runtime: &dyn ContainerRuntime,
-    watch: &[String],
-    health_timeout: Duration,
-    host_healthy: F,
-) -> ConsumerRecoverResult
-where
-    F: Fn(&str) -> bool,
-{
-    let mut result = ConsumerRecoverResult::default();
-
-    let binds = match runtime.binds_under(watch).await {
-        Ok(b) => b,
-        Err(e) => {
-            result.errors.push(format!("enumerate consumer binds: {e}"));
-            return result;
-        }
-    };
-    if binds.is_empty() {
-        result.no_consumers_found = true;
-        return result;
-    }
-
-    for bind in &binds {
-        // Probe the bind ROOT as seen inside the consumer.
-        match runtime
-            .probe_path(&bind.container_id, &bind.container_target, health_timeout)
-            .await
-        {
-            Ok(ConsumerProbe::Ok) => result.healthy.push(bind.container_name.clone()),
-            Ok(ConsumerProbe::Stale) => {
-                // Guard: only remediate a stale bind when the HOST mount is
-                // healthy. A host-wide outage makes every consumer stale;
-                // restarting then is pointless and stormy.
-                if !host_healthy(&bind.host_source) {
-                    result.skipped_host_stale.push(bind.container_name.clone());
-                    continue;
-                }
-                match runtime.restart(&bind.container_id).await {
-                    Ok(()) => match runtime
-                        .probe_path(&bind.container_id, &bind.container_target, health_timeout)
-                        .await
-                    {
-                        Ok(ConsumerProbe::Ok) => result.recovered.push(bind.container_name.clone()),
-                        Ok(ConsumerProbe::Stale) => {
-                            result.still_stale.push(bind.container_name.clone())
-                        }
-                        Err(e) => {
-                            result.still_stale.push(bind.container_name.clone());
-                            result
-                                .errors
-                                .push(format!("re-probe {}: {e}", bind.container_name));
-                        }
-                    },
-                    Err(e) => {
-                        result.still_stale.push(bind.container_name.clone());
-                        result
-                            .errors
-                            .push(format!("restart {}: {e}", bind.container_name));
-                    }
-                }
-            }
-            Err(e) => result
-                .errors
-                .push(format!("probe {}: {e}", bind.container_name)),
-        }
-    }
-
-    result
-}
-
-/// Production [`ContainerRuntime`] that shells `docker` via
-/// `plugin_toolkit::process::Command`. All runtime shell-outs are confined here
-/// so the sweep logic stays runtime-agnostic and mockable.
-pub struct DockerCli;
-
-/// Tab-separated one-line-per-bind format emitted by `docker inspect`:
-/// `id\tname\tsource\tdestination` for every `bind`-type mount.
-const DOCKER_BIND_FORMAT: &str = "{{range .Mounts}}{{if eq .Type \"bind\"}}{{$.Id}}\t{{$.Name}}\t{{.Source}}\t{{.Destination}}\n{{end}}{{end}}";
-
-#[orca_async]
-impl ContainerRuntime for DockerCli {
-    async fn binds_under(&self, watch: &[String]) -> Result<Vec<ConsumerBind>, NfsError> {
-        // Running container ids first, then inspect their bind mounts.
-        let stdout = Command::new("docker")
-            .arg("ps")
-            .arg("--no-trunc")
-            .arg("--format")
-            .arg("{{.ID}}")
-            .run_checked()
-            .await
-            .map_err(|e| {
-                NfsError::Read(std::io::Error::other(format!(
-                    "docker ps exit {:?}: {}",
-                    e.code, e.stderr
-                )))
-            })?;
-        let ids: Vec<String> = String::from_utf8_lossy(&stdout)
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        // `Command::arg` consumes `self` (builder), so fold the ids in.
-        let mut inspect = Command::new("docker")
-            .arg("inspect")
-            .arg("--format")
-            .arg(DOCKER_BIND_FORMAT);
-        for id in &ids {
-            inspect = inspect.arg(id);
-        }
-        let stdout = inspect.run_checked().await.map_err(|e| {
-            NfsError::Read(std::io::Error::other(format!(
-                "docker inspect exit {:?}: {}",
-                e.code, e.stderr
-            )))
-        })?;
-        Ok(parse_docker_binds(&String::from_utf8_lossy(&stdout), watch))
-    }
-
-    async fn probe_path(
-        &self,
-        id: &str,
-        path: &str,
-        timeout: Duration,
-    ) -> Result<ConsumerProbe, NfsError> {
-        let fut = Command::new("docker")
-            .arg("exec")
-            .arg(id)
-            .arg("stat")
-            .arg("--")
-            .arg(path)
-            .output();
-        match plugin_toolkit::time::timeout(timeout, fut).await {
-            // In-container `stat` hung past the budget → stale (same rule as the
-            // host probe's timeout→stale).
-            None => Ok(ConsumerProbe::Stale),
-            Some(Err(e)) => Err(NfsError::Read(e)),
-            Some(Ok(out)) if out.status.success => Ok(ConsumerProbe::Ok),
-            Some(Ok(out)) => {
-                if classify_stat_failure(&String::from_utf8_lossy(&out.stderr)) == "stale" {
-                    Ok(ConsumerProbe::Stale)
-                } else {
-                    Err(NfsError::Read(std::io::Error::other(
-                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                    )))
-                }
-            }
-        }
-    }
-
-    async fn restart(&self, id: &str) -> Result<(), NfsError> {
-        Command::new("docker")
-            .arg("restart")
-            .arg(id)
-            .run_checked()
-            .await
-            .map(|_stdout| ())
-            .map_err(|e| {
-                NfsError::Read(std::io::Error::other(format!(
-                    "docker restart {id} exit {:?}: {}",
-                    e.code, e.stderr
-                )))
-            })
-    }
-}
-
-/// Parse the `id\tname\tsource\tdestination` lines emitted by
-/// [`DOCKER_BIND_FORMAT`], keeping only binds whose host source falls under a
-/// watched prefix. Pulled out so it's testable without Docker.
-fn parse_docker_binds(raw: &str, watch: &[String]) -> Vec<ConsumerBind> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let (Some(id), Some(name), Some(source), Some(dest)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        if !path_under_watch(source, watch) {
-            continue;
-        }
-        out.push(ConsumerBind {
-            container_id: id.to_string(),
-            // docker prefixes names with '/'; strip it for reporting.
-            container_name: name.trim_start_matches('/').to_string(),
-            host_source: source.to_string(),
-            container_target: dest.to_string(),
-        });
-    }
-    out
-}
-
-/// One Proxmox guest row from `pct list` (LXC container). `status` is the raw
-/// `pct` state string (`running` / `stopped`); `name` is the guest hostname.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PctGuest {
-    pub vmid: String,
-    pub status: String,
-    pub name: String,
-}
-
-/// Production [`ContainerRuntime`] for Proxmox LXC guests, shelling `pct` via
-/// `plugin_toolkit::process::Command`. Mirrors [`DockerCli`]: every `pct`
-/// shell-out is confined here so the sweep stays runtime-agnostic and mockable.
-/// Unlike Docker, a Proxmox guest can be STOPPED yet still declare a managed
-/// bind in its config — the frigg incident where jellyfin (LXC 113) sat stopped
-/// because a host-local start-gate hook never retried — so this runtime also
-/// implements [`ContainerRuntime::start_gated`].
-pub struct PctCli;
-
-/// `pct list` → typed guest rows. Best-effort shell-out; a `pct` failure is a
-/// hard `Err` (the caller records it), mirroring `DockerCli::binds_under`.
-async fn pct_list() -> Result<Vec<PctGuest>, NfsError> {
-    let stdout = Command::new("pct")
-        .arg("list")
-        .run_checked()
-        .await
-        .map_err(|e| {
-            NfsError::Read(std::io::Error::other(format!(
-                "pct list exit {:?}: {}",
-                e.code, e.stderr
-            )))
-        })?;
-    Ok(parse_pct_list(&String::from_utf8_lossy(&stdout)))
-}
-
-/// `pct config <vmid>` → raw config text.
-async fn pct_config(vmid: &str) -> Result<String, NfsError> {
-    let stdout = Command::new("pct")
-        .arg("config")
-        .arg(vmid)
-        .run_checked()
-        .await
-        .map_err(|e| {
-            NfsError::Read(std::io::Error::other(format!(
-                "pct config {vmid} exit {:?}: {}",
-                e.code, e.stderr
-            )))
-        })?;
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
-}
-
-/// `pct start <vmid>`.
-async fn pct_start(vmid: &str) -> Result<(), NfsError> {
-    Command::new("pct")
-        .arg("start")
-        .arg(vmid)
-        .run_checked()
-        .await
-        .map(|_stdout| ())
-        .map_err(|e| {
-            NfsError::Read(std::io::Error::other(format!(
-                "pct start {vmid} exit {:?}: {}",
-                e.code, e.stderr
-            )))
-        })
-}
-
-#[orca_async]
-impl ContainerRuntime for PctCli {
-    async fn binds_under(&self, watch: &[String]) -> Result<Vec<ConsumerBind>, NfsError> {
-        // Only RUNNING guests can be `pct exec`-probed; stopped guests are the
-        // start_gated path. Collect the managed binds of each running guest.
-        let mut out = Vec::new();
-        for g in pct_list().await?.iter().filter(|g| g.status == "running") {
-            let cfg = pct_config(&g.vmid).await?;
-            out.extend(parse_pct_config_binds(&g.vmid, &g.name, &cfg, watch));
-        }
-        Ok(out)
-    }
-
-    async fn probe_path(
-        &self,
-        id: &str,
-        path: &str,
-        timeout: Duration,
-    ) -> Result<ConsumerProbe, NfsError> {
-        let fut = Command::new("pct")
-            .arg("exec")
-            .arg(id)
-            .arg("--")
-            .arg("stat")
-            .arg("--")
-            .arg(path)
-            .output();
-        match plugin_toolkit::time::timeout(timeout, fut).await {
-            // In-guest `stat` hung past the budget → stale (same rule as the host
-            // probe's timeout→stale).
-            None => Ok(ConsumerProbe::Stale),
-            Some(Err(e)) => Err(NfsError::Read(e)),
-            Some(Ok(out)) if out.status.success => Ok(ConsumerProbe::Ok),
-            Some(Ok(out)) => {
-                if classify_stat_failure(&String::from_utf8_lossy(&out.stderr)) == "stale" {
-                    Ok(ConsumerProbe::Stale)
-                } else {
-                    Err(NfsError::Read(std::io::Error::other(
-                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                    )))
-                }
-            }
-        }
-    }
-
-    async fn restart(&self, id: &str) -> Result<(), NfsError> {
-        Command::new("pct")
-            .arg("reboot")
-            .arg(id)
-            .run_checked()
-            .await
-            .map(|_stdout| ())
-            .map_err(|e| {
-                NfsError::Read(std::io::Error::other(format!(
-                    "pct reboot {id} exit {:?}: {}",
-                    e.code, e.stderr
-                )))
-            })
-    }
-
-    async fn start_gated(
-        &self,
-        watch: &[String],
-        host_healthy: &(dyn Fn(&str) -> bool + Sync),
-    ) -> Vec<String> {
-        let guests = match pct_list().await {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-        let mut started = Vec::new();
-        for g in guests.iter().filter(|g| g.status == "stopped") {
-            let Ok(cfg) = pct_config(&g.vmid).await else {
-                continue;
-            };
-            let binds = parse_pct_config_binds(&g.vmid, &g.name, &cfg, watch);
-            // Start only when a managed bind's covering host mount is healthy —
-            // never start a guest against a stale/absent mount (the guard the old
-            // hook only ever applied at the "refuse" edge, never the retry edge).
-            if binds.iter().any(|b| host_healthy(&b.host_source))
-                && pct_start(&g.vmid).await.is_ok()
-            {
-                started.push(g.name.clone());
-            }
-        }
-        started
-    }
-}
-
-/// Parse `pct list` output into guest rows. The columns are `VMID Status [Lock]
-/// Name` with a variable-width, sometimes-empty `Lock`; `Name` is always last.
-/// Pure so it's testable without `pct`.
-fn parse_pct_list(raw: &str) -> Vec<PctGuest> {
-    let mut out = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("VMID") {
-            continue;
-        }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // Need at least vmid + status + name; take vmid/status from the front and
-        // name from the end so a present-or-absent Lock column doesn't shift it.
-        let (Some(vmid), Some(status), Some(name)) = (fields.first(), fields.get(1), fields.last())
-        else {
-            continue;
-        };
-        if !vmid.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        out.push(PctGuest {
-            vmid: vmid.to_string(),
-            status: status.to_string(),
-            name: name.to_string(),
-        });
-    }
-    out
-}
-
-/// Parse the `mpN:` bind entries from a `pct config <vmid>` dump, keeping only
-/// binds whose host source falls under a watched prefix. Proxmox renders a
-/// mountpoint as `mpN: <volume-or-hostpath>,mp=<container_path>[,opt...]`. A
-/// **bind** of a host directory has an absolute path as its first token; a
-/// storage-volume mount (e.g. `local-lvm:vm-113-disk-1`) does not and is
-/// skipped — only host binds can carry a managed NFS path. Pure so it's testable
-/// without `pct`.
-fn parse_pct_config_binds(
-    vmid: &str,
-    name: &str,
-    config_raw: &str,
-    watch: &[String],
-) -> Vec<ConsumerBind> {
-    let mut out = Vec::new();
-    for line in config_raw.lines() {
-        let line = line.trim();
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        // mpN: keys are the additional mountpoints; rootfs is never a network bind.
-        let key = key.trim();
-        if !(key.starts_with("mp") && key.len() > 2 && key[2..].chars().all(|c| c.is_ascii_digit()))
-        {
-            continue;
-        }
-        let mut parts = value.trim().split(',');
-        let Some(source) = parts.next().map(str::trim) else {
-            continue;
-        };
-        // Host bind, not a storage volume: absolute path only.
-        if !source.starts_with('/') {
-            continue;
-        }
-        let Some(target) = parts
-            .find_map(|p| p.trim().strip_prefix("mp="))
-            .map(str::trim)
-        else {
-            continue;
-        };
-        if !path_under_watch(source, watch) {
-            continue;
-        }
-        out.push(ConsumerBind {
-            container_id: vmid.to_string(),
-            container_name: name.to_string(),
-            host_source: source.to_string(),
-            container_target: target.to_string(),
-        });
-    }
-    out
 }
 
 // ── nfs option grammar ──────────────────────────────────────────────────────
@@ -1910,7 +1265,7 @@ impl StorageBackend for NfsBackend {
         // fields, so consumer results are folded into its existing vecs with a
         // `consumer:` tag (and `started:` for stopped guests brought up) so a
         // caller can still see them.
-        let runtimes = detect_runtimes().await;
+        let runtimes = mount_recover::detect_runtimes().await;
         let mut r = recover_stale_multi(&runtimes, watch, "", health_timeout)
             .await
             .map_err(|e| StorageError::Transport(e.to_string()))?;
@@ -2170,26 +1525,6 @@ proc /proc proc defaults 0 0
         assert_eq!(s, "stale");
     }
 
-    #[test]
-    fn classify_stat_failure_maps_estale_to_stale() {
-        // Fast ESTALE — the consumer-bind failure mode — must classify stale so
-        // the force-release/remount recovery fires (regression: it used to
-        // return "error: …").
-        assert_eq!(
-            classify_stat_failure("stat: cannot statx '/mnt/pool': Stale file handle"),
-            "stale"
-        );
-        // Case-insensitive.
-        assert_eq!(classify_stat_failure("STALE FILE HANDLE"), "stale");
-    }
-
-    #[test]
-    fn classify_stat_failure_keeps_other_errors_as_error() {
-        let s = classify_stat_failure("stat: cannot statx '/mnt/pool': No such file or directory");
-        assert!(s.starts_with("error:"), "got: {s}");
-        assert!(s.contains("No such file or directory"));
-    }
-
     #[tokio::test]
     async fn check_health_returns_stale_when_timeout_elapses() {
         // 1ns budget against the real `stat` process expires before exec
@@ -2422,77 +1757,6 @@ new:/export /mnt/x nfs4 rw 0 0
         assert!(!r.no_stale_found);
     }
 
-    // ── consumer-aware bind-mount staleness (Part B) ──────────────────────────
-
-    #[test]
-    fn parse_docker_binds_filters_to_watched_sources() {
-        // id\tname\tsource\tdest — three binds, only two under /mnt/pool.
-        let raw = "\
-abc\t/downloader\t/mnt/pool/downloads\t/data
-def\t/media\t/mnt/pool/data/media\t/media
-ghi\t/other\t/srv/other\t/srv
-";
-        let watch = vec!["/mnt/pool".to_string()];
-        let binds = parse_docker_binds(raw, &watch);
-        assert_eq!(binds.len(), 2, "only /mnt/pool binds");
-        assert_eq!(binds[0].container_name, "downloader", "'/' stripped");
-        assert_eq!(binds[0].host_source, "/mnt/pool/downloads");
-        assert_eq!(binds[0].container_target, "/data");
-        assert_eq!(binds[1].container_target, "/media");
-    }
-
-    #[test]
-    fn parse_pct_list_skips_header_and_reads_status_and_name() {
-        // Header, a running guest with no lock, a stopped guest, and a locked
-        // guest (lock column present) whose Name must still land as the last col.
-        let raw = "\
-VMID       Status     Lock         Name
-113        running                 jellyfin
-114        stopped                 sonarr
-115        running    backup       radarr
-";
-        let guests = parse_pct_list(raw);
-        assert_eq!(guests.len(), 3);
-        assert_eq!(guests[0].vmid, "113");
-        assert_eq!(guests[0].status, "running");
-        assert_eq!(guests[0].name, "jellyfin");
-        assert_eq!(guests[1].status, "stopped");
-        assert_eq!(guests[1].name, "sonarr");
-        // Lock column present — Name is still parsed from the end.
-        assert_eq!(guests[2].name, "radarr");
-    }
-
-    #[test]
-    fn parse_pct_config_binds_keeps_host_binds_under_watch_only() {
-        // mp0 host bind under watch; mp1 host bind outside watch; mp2 storage
-        // volume (not a host path); rootfs ignored. Only mp0 survives.
-        let cfg = "\
-arch: amd64
-hostname: jellyfin
-mp0: /mnt/pool/media,mp=/data/media
-mp1: /srv/local,mp=/srv
-mp2: local-lvm:vm-113-disk-1,mp=/scratch
-rootfs: local-lvm:vm-113-disk-0,size=8G
-";
-        let watch = vec!["/mnt/pool".to_string()];
-        let binds = parse_pct_config_binds("113", "jellyfin", cfg, &watch);
-        assert_eq!(binds.len(), 1, "only the watched host bind");
-        assert_eq!(binds[0].container_id, "113");
-        assert_eq!(binds[0].container_name, "jellyfin");
-        assert_eq!(binds[0].host_source, "/mnt/pool/media");
-        assert_eq!(binds[0].container_target, "/data/media");
-    }
-
-    #[test]
-    fn parse_pct_config_binds_extracts_mp_after_options() {
-        // `mp=` need not be the second field; extra options may precede it.
-        let cfg = "mp0: /mnt/pool/data,backup=1,mp=/data,ro=1\n";
-        let watch = vec!["/mnt/pool".to_string()];
-        let binds = parse_pct_config_binds("120", "app", cfg, &watch);
-        assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0].container_target, "/data");
-    }
-
     #[test]
     fn path_under_watch_matches_prefix_and_subpaths() {
         let watch = vec!["/mnt/pool".to_string()];
@@ -2532,208 +1796,23 @@ rootfs: local-lvm:vm-113-disk-0,size=8G
         assert!(!host_source_healthy("/srv/elsewhere", &mounts));
     }
 
-    // ── mocked container runtime ──────────────────────────────────────────────
-
-    /// Scripted [`ContainerRuntime`] — no Docker. Records restarts and returns a
-    /// probe verdict per container that can flip after a restart (models a
-    /// consumer coming back healthy once re-bound).
-    struct MockRuntime {
-        binds: Vec<ConsumerBind>,
-        /// container_id → (probe before restart, probe after restart).
-        probes: std::collections::HashMap<String, (ConsumerProbe, ConsumerProbe)>,
-        restarted: std::sync::Mutex<Vec<String>>,
-        restart_fails: std::collections::HashSet<String>,
-        enumerate_fails: bool,
-    }
-
-    impl MockRuntime {
-        fn new(binds: Vec<ConsumerBind>) -> Self {
-            Self {
-                binds,
-                probes: std::collections::HashMap::new(),
-                restarted: std::sync::Mutex::new(Vec::new()),
-                restart_fails: std::collections::HashSet::new(),
-                enumerate_fails: false,
-            }
-        }
-    }
-
-    #[plugin_toolkit::async_trait::async_trait]
-    impl ContainerRuntime for MockRuntime {
-        async fn binds_under(&self, _watch: &[String]) -> Result<Vec<ConsumerBind>, NfsError> {
-            if self.enumerate_fails {
-                return Err(NfsError::Read(std::io::Error::other("boom")));
-            }
-            Ok(self.binds.clone())
-        }
-        async fn probe_path(
-            &self,
-            id: &str,
-            _path: &str,
-            _timeout: Duration,
-        ) -> Result<ConsumerProbe, NfsError> {
-            let (before, after) = self
-                .probes
-                .get(id)
-                .copied()
-                .unwrap_or((ConsumerProbe::Ok, ConsumerProbe::Ok));
-            let already_restarted = self.restarted.lock().unwrap().iter().any(|r| r == id);
-            Ok(if already_restarted { after } else { before })
-        }
-        async fn restart(&self, id: &str) -> Result<(), NfsError> {
-            if self.restart_fails.contains(id) {
-                return Err(NfsError::Read(std::io::Error::other("restart failed")));
-            }
-            self.restarted.lock().unwrap().push(id.to_string());
-            Ok(())
-        }
-    }
-
-    fn bind(id: &str, name: &str, source: &str, target: &str) -> ConsumerBind {
-        ConsumerBind {
-            container_id: id.into(),
-            container_name: name.into(),
-            host_source: source.into(),
-            container_target: target.into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn consumer_sweep_restarts_when_host_healthy_and_consumer_stale() {
-        // The incident: host healthy, consumer bind ROOT ESTALE → restart, and
-        // it comes back healthy after re-bind.
-        let mut rt = MockRuntime::new(vec![bind(
-            "c1",
-            "downloader",
-            "/mnt/pool/downloads",
-            "/data",
-        )]);
-        rt.probes
-            .insert("c1".into(), (ConsumerProbe::Stale, ConsumerProbe::Ok));
-
-        let res =
-            recover_stale_consumers(&rt, &["/mnt/pool".into()], Duration::from_secs(1), |_| {
-                true // host healthy
-            })
-            .await;
-
-        assert_eq!(res.recovered, vec!["downloader".to_string()]);
-        assert!(res.still_stale.is_empty());
-        assert!(res.skipped_host_stale.is_empty());
-        assert_eq!(*rt.restarted.lock().unwrap(), vec!["c1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn consumer_sweep_skips_restart_during_host_outage() {
-        // Guard: consumer ESTALE but the HOST mount is also stale → do NOT
-        // restart (host-wide outage; a restart would not help and could storm).
-        let mut rt = MockRuntime::new(vec![bind("c1", "media", "/mnt/pool/data/media", "/media")]);
-        rt.probes
-            .insert("c1".into(), (ConsumerProbe::Stale, ConsumerProbe::Ok));
-
-        let res = recover_stale_consumers(
-            &rt,
-            &["/mnt/pool".into()],
-            Duration::from_secs(1),
-            |_| false, // host UNhealthy
-        )
-        .await;
-
-        assert_eq!(res.skipped_host_stale, vec!["media".to_string()]);
-        assert!(res.recovered.is_empty());
-        assert!(
-            rt.restarted.lock().unwrap().is_empty(),
-            "must not restart during host outage"
-        );
-    }
-
-    #[tokio::test]
-    async fn consumer_sweep_leaves_healthy_consumers_alone() {
-        let mut rt = MockRuntime::new(vec![bind("c1", "healthy-app", "/mnt/pool/downloads", "/d")]);
-        rt.probes
-            .insert("c1".into(), (ConsumerProbe::Ok, ConsumerProbe::Ok));
-        let res =
-            recover_stale_consumers(&rt, &["/mnt/pool".into()], Duration::from_secs(1), |_| true)
-                .await;
-        assert_eq!(res.healthy, vec!["healthy-app".to_string()]);
-        assert!(rt.restarted.lock().unwrap().is_empty(), "idempotent");
-    }
-
-    #[tokio::test]
-    async fn consumer_sweep_reports_still_stale_when_restart_does_not_clear() {
-        let mut rt = MockRuntime::new(vec![bind("c1", "stuck", "/mnt/pool/downloads", "/d")]);
-        // Stays stale even after restart.
-        rt.probes
-            .insert("c1".into(), (ConsumerProbe::Stale, ConsumerProbe::Stale));
-        let res =
-            recover_stale_consumers(&rt, &["/mnt/pool".into()], Duration::from_secs(1), |_| true)
-                .await;
-        assert_eq!(res.still_stale, vec!["stuck".to_string()]);
-        assert!(res.recovered.is_empty());
-    }
-
-    #[tokio::test]
-    async fn consumer_sweep_records_restart_failure() {
-        let mut rt = MockRuntime::new(vec![bind("c1", "flaky", "/mnt/pool/downloads", "/d")]);
-        rt.probes
-            .insert("c1".into(), (ConsumerProbe::Stale, ConsumerProbe::Ok));
-        rt.restart_fails.insert("c1".into());
-        let res =
-            recover_stale_consumers(&rt, &["/mnt/pool".into()], Duration::from_secs(1), |_| true)
-                .await;
-        assert_eq!(res.still_stale, vec!["flaky".to_string()]);
-        assert!(res.errors.iter().any(|e| e.contains("restart flaky")));
-    }
-
-    #[tokio::test]
-    async fn consumer_sweep_no_consumers_is_noop() {
-        let rt = MockRuntime::new(vec![]);
-        let res =
-            recover_stale_consumers(&rt, &["/mnt/pool".into()], Duration::from_secs(1), |_| true)
-                .await;
-        assert!(res.no_consumers_found);
-        assert!(res.recovered.is_empty());
-    }
-
-    #[tokio::test]
-    async fn consumer_sweep_enumerate_failure_is_recorded_not_fatal() {
-        let mut rt = MockRuntime::new(vec![]);
-        rt.enumerate_fails = true;
-        let res =
-            recover_stale_consumers(&rt, &["/mnt/pool".into()], Duration::from_secs(1), |_| true)
-                .await;
-        assert!(!res.no_consumers_found);
-        assert!(res.errors.iter().any(|e| e.contains("enumerate")));
-    }
-
     #[test]
-    fn consumer_recover_result_round_trips_through_serde() {
-        let c = ConsumerRecoverResult {
-            healthy: vec!["a".into()],
-            recovered: vec!["b".into()],
-            skipped_host_stale: vec!["c".into()],
-            still_stale: vec!["d".into()],
-            errors: vec!["restart d: boom".into()],
-            no_consumers_found: false,
-        };
-        let s = serde_json::to_string(&c).unwrap();
-        let back: ConsumerRecoverResult = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.healthy, c.healthy);
-        assert_eq!(back.recovered, c.recovered);
-        assert_eq!(back.skipped_host_stale, c.skipped_host_stale);
-        assert_eq!(back.still_stale, c.still_stale);
-        assert_eq!(back.errors, c.errors);
-        assert!(!back.no_consumers_found);
-
-        // And nested inside RecoverResult.
+    fn recover_result_serializes_nested_consumers() {
+        // The consumer machinery + its serde round-trip live in the shared
+        // `mount_recover` module now; nfs only verifies RecoverResult carries the
+        // `consumers` field through serde (and omits it when None).
         let r = RecoverResult {
-            consumers: Some(c),
+            consumers: Some(mount_recover::ConsumerRecoverResult::default()),
             ..Default::default()
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("consumers"));
         let back: RecoverResult = serde_json::from_str(&s).unwrap();
         assert!(back.consumers.is_some());
+
+        // Omitted entirely when None.
+        let empty = serde_json::to_string(&RecoverResult::default()).unwrap();
+        assert!(!empty.contains("consumers"));
     }
 
     #[test]
