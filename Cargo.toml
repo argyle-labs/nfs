@@ -32,7 +32,7 @@ path = "src/main.rs"
 # owns its own NFS option grammar and hands core only the opaque `OptionSet::Raw`
 # string (core is fstype-agnostic; NFS never materializes a `SecretFile`).
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.9-rc.16" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.9-rc.19" }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness writes a fake mount tree (`tempfile`) and
