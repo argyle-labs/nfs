@@ -12,9 +12,9 @@ use plugin_toolkit::orca_async;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::{Command, ToolError};
 use plugin_toolkit::storage::{
-    apply_option_floor, mount_table_of, parse_option_string, probe_health, Capability, ExportEntry,
-    Health, MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionBuilder, OptionSet,
-    RecoverOutcome, Share, StorageBackend, StorageError, StorageKind,
+    apply_option_floor, mount_table_of, parse_option_string, probe_health_rw, Capability,
+    ExportEntry, Health, MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionBuilder,
+    OptionSet, RecoverOutcome, RecoveryAction, Share, StorageBackend, StorageError, StorageKind,
 };
 
 /// Network filesystem types this crate reports on. Single source shared by the
@@ -486,20 +486,40 @@ pub fn filter_by_fstype(mounts: Vec<Mount>, fstype: &str) -> Vec<Mount> {
     mounts.into_iter().filter(|m| m.fstype == fstype).collect()
 }
 
-/// Probe a mountpoint's liveness, returning `"ok"` / `"stale"` / `"error: …"`.
+/// Probe a mountpoint's health, returning `"ok"` / `"stale"` / `"write_denied"`
+/// / `"error: …"`.
 ///
-/// Delegates to the storage domain's generic [`probe_health`] so the plugin and
-/// core classify live-vs-stale-vs-absent identically (nfs#16). `probe_health`
-/// `stat`s the path on a worker thread with the timeout budget: a hang past the
-/// budget, an `ESTALE`, or any I/O error map to [`Health::Stale`]; a missing
-/// path (failed automount fell through to a bare dir) maps to [`Health::Missing`].
-/// Both collapse to `"stale"` here so the force-release/remount recovery fires
-/// for either. The string shape is kept for the `Mount::health` report field.
+/// Delegates to the storage domain's [`probe_health_rw`] so the plugin and core
+/// classify identically (nfs#16). It first `stat`s the path on a worker thread
+/// with the timeout budget (a hang, `ESTALE`, or any I/O error → [`Health::Stale`];
+/// a missing path → [`Health::Missing`]) and, only when the mount is live, runs a
+/// marker-file write probe. That surfaces the permission-drift class: a share
+/// whose mode/owner drifted so the mounting identity lost write access still
+/// reads clean but denies writes ([`Health::WriteDenied`]) — the immich
+/// upload-loop shape.
+///
+/// The recover-vs-leave-vs-indeterminate DECISION comes from the shared storage
+/// table ([`Health::recovery_action`]), single-sourced with smb and core so the
+/// `"stale"` collapse can't drift from the canonical Recover class. Only the
+/// report *labels* are nfs's own (kept for the `Mount::health` field contract):
+/// Stale/Timeout/Missing collapse to `"stale"` so recovery fires; `write_denied`
+/// does NOT (a remount can't fix a server-side perm drift — the fix is a
+/// server-side chmod/chown).
+///
+/// Note: an intentionally read-only (`ro`) mount reports `write_denied` —
+/// accurate, if not actionable; recovery ignores it, so it is report-only noise.
 pub async fn check_health(mountpoint: &str, timeout: Duration) -> String {
-    match probe_health(mountpoint, timeout) {
-        Health::Ok => "ok".to_string(),
-        Health::Stale | Health::Timeout | Health::Missing => "stale".to_string(),
-        Health::Error => "error: probe failed".to_string(),
+    let health = probe_health_rw(mountpoint, timeout);
+    match health.recovery_action() {
+        RecoveryAction::Recover => "stale".to_string(),
+        // Indeterminate is reported verbatim, never treated as `ok` (so the
+        // consumer guard and recovery never act on doubt) nor `stale` (so a probe
+        // glitch does not force-release a healthy mount).
+        RecoveryAction::Indeterminate if health == Health::Unknown => "error: unknown".to_string(),
+        RecoveryAction::Indeterminate => "error: probe failed".to_string(),
+        // Live and readable but writes denied: reported distinctly.
+        RecoveryAction::Leave if health == Health::WriteDenied => "write_denied".to_string(),
+        RecoveryAction::Leave => "ok".to_string(),
     }
 }
 
@@ -1512,6 +1532,25 @@ proc /proc proc defaults 0 0
         let dir = tempfile::tempdir().unwrap();
         let s = check_health(dir.path().to_str().unwrap(), Duration::from_secs(5)).await;
         assert_eq!(s, "ok");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_health_returns_write_denied_for_readonly_dir() {
+        // Perm-drift shape: a live, readable dir the process can't write to
+        // (0o555). `probe_health_rw` stats it clean, then the write probe fails
+        // EACCES → "write_denied", NOT "ok" (masks the drift) or "stale" (a
+        // remount can't fix server-side perms). Skipped under root, which
+        // bypasses mode bits.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let s = check_health(dir.path().to_str().unwrap(), Duration::from_secs(5)).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).ok();
+        if s == "ok" {
+            return; // running as root: mode bits bypassed, inconclusive
+        }
+        assert_eq!(s, "write_denied");
     }
 
     #[tokio::test]
