@@ -1347,7 +1347,7 @@ nasbox:/legacy /mnt/legacy smbfs ro 0 0
 
     // `exportfs -v` view: one client per line, path repeated, `<world>` for `*`.
     const SAMPLE_EXPORTFS: &str = "\
-/srv/nfs/data \t10.10.10.0/24(sync,wdelay,hide,no_subtree_check,fsid=1,sec=sys,rw,secure,root_squash)
+/srv/nfs/data \t10.0.0.0/24(sync,wdelay,hide,no_subtree_check,fsid=1,sec=sys,rw,secure,root_squash)
 /srv/nfs/data \t192.168.1.0/24(sync,wdelay,hide,no_subtree_check,fsid=1,sec=sys,ro,secure,root_squash)
 /srv/nfs/media \t<world>(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash)
 ";
@@ -1355,7 +1355,7 @@ nasbox:/legacy /mnt/legacy smbfs ro 0 0
     // `/etc/exports` view: all clients on one line, comments and blanks skipped.
     const SAMPLE_ETC_EXPORTS: &str = "\
 # NFS exports
-/srv/nfs/data 10.10.10.0/24(rw,sync,no_subtree_check,fsid=1) 192.168.1.0/24(ro,sync)
+/srv/nfs/data 10.0.0.0/24(rw,sync,no_subtree_check,fsid=1) 192.168.1.0/24(ro,sync)
 
 /srv/nfs/media *(ro,sync)
 ";
@@ -1365,7 +1365,7 @@ nasbox:/legacy /mnt/legacy smbfs ro 0 0
         let exports = parse_exports(SAMPLE_EXPORTFS);
         assert_eq!(exports.len(), 2);
         let data = exports.iter().find(|e| e.path == "/srv/nfs/data").unwrap();
-        assert_eq!(data.allowed_clients, ["10.10.10.0/24", "192.168.1.0/24"]);
+        assert_eq!(data.allowed_clients, ["10.0.0.0/24", "192.168.1.0/24"]);
         assert_eq!(data.fsid.as_deref(), Some("1"));
         assert!(data.options.iter().any(|o| o == "rw"));
         assert!(data.options.iter().any(|o| o == "ro"));
@@ -1380,7 +1380,7 @@ nasbox:/legacy /mnt/legacy smbfs ro 0 0
         let exports = parse_exports(SAMPLE_ETC_EXPORTS);
         assert_eq!(exports.len(), 2);
         let data = exports.iter().find(|e| e.path == "/srv/nfs/data").unwrap();
-        assert_eq!(data.allowed_clients, ["10.10.10.0/24", "192.168.1.0/24"]);
+        assert_eq!(data.allowed_clients, ["10.0.0.0/24", "192.168.1.0/24"]);
         assert_eq!(data.fsid.as_deref(), Some("1"));
         let media = exports.iter().find(|e| e.path == "/srv/nfs/media").unwrap();
         assert_eq!(media.allowed_clients, ["*"]);
@@ -1996,8 +1996,8 @@ new:/export /mnt/x nfs4 rw 0 0
     #[test]
     fn normalize_source_canonicalizes_and_rejects_malformed() {
         assert_eq!(
-            normalize_nfs_source(" 10.10.10.10:/mnt/user/downloads ").unwrap(),
-            "10.10.10.10:/mnt/user/downloads"
+            normalize_nfs_source(" 10.0.0.10:/mnt/user/downloads ").unwrap(),
+            "10.0.0.10:/mnt/user/downloads"
         );
         assert!(normalize_nfs_source("").is_err());
         assert!(normalize_nfs_source("no-colon-path").is_err());
@@ -2008,7 +2008,7 @@ new:/export /mnt/x nfs4 rw 0 0
     #[tokio::test]
     async fn validate_spec_rejects_conflicting_options() {
         let backend = NfsBackend::default();
-        let spec = nfs_mount_spec("10.10.10.10:/mnt/user/downloads", Some("hard,soft"));
+        let spec = nfs_mount_spec("10.0.0.10:/mnt/user/downloads", Some("hard,soft"));
         assert!(backend.validate_spec(&spec).await.is_err());
     }
 
@@ -2018,12 +2018,12 @@ new:/export /mnt/x nfs4 rw 0 0
     async fn validate_and_render_round_trips_freyr_example() {
         let backend = NfsBackend::default();
         let spec = nfs_mount_spec(
-            "10.10.10.10:/mnt/user/downloads",
+            "10.0.0.10:/mnt/user/downloads",
             Some("hard,timeo=600,retrans=2,_netdev,nofail"),
         );
         let normalized = backend.validate_spec(&spec).await.expect("validate");
 
-        assert_eq!(normalized.source, "10.10.10.10:/mnt/user/downloads");
+        assert_eq!(normalized.source, "10.0.0.10:/mnt/user/downloads");
         assert!(
             normalized.failover_sources.is_empty(),
             "single source, no failover"
