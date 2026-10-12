@@ -3,3 +3,8 @@
 # git source pinned in Cargo.toml.
 [net]
 git-fetch-with-cli = true
+
+# orca's workspace manifest references `registry = "gitea"`; cargo cannot load
+# the plugin-toolkit git dep unless that registry name resolves here too.
+[registries.gitea]
+index = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"

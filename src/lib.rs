@@ -799,8 +799,11 @@ pub async fn recover_stale(
 /// with the `smb` backend rather than duplicated here. nfs supplies only the
 /// `host_healthy` closure, derived from its *post-recovery* mount table (a source
 /// is healthy when its longest covering network mount probes `ok`), so the shared
-/// guard never triggers a restart storm during a host-wide outage: a stale/absent
-/// source yields `false` and those consumers are recorded `skipped_host_stale`.
+/// guard never triggers a restart storm during a host-wide outage: a stale source
+/// yields `Some(false)` and those consumers are recorded `skipped_host_stale`;
+/// a source no nfs mount covers yields `None` ("not this backend's"), which the
+/// shared sweep leaves untouched. Bind sources match mountpoints as raw paths, so
+/// a container must bind the real mount path; a symlinked source is not seen as nfs's.
 ///
 /// A failure to read `/proc/mounts` during the host sweep is fatal (`Err`), same
 /// as [`recover_stale`]. The consumer sweep itself is best-effort.
@@ -817,24 +820,32 @@ pub async fn recover_stale_multi(
     let mounts = list(watch, fstype_filter, health_timeout).await?;
     let host_healthy = |source: &str| host_source_healthy(source, &mounts);
 
-    let consumers =
-        mount_recover::recover_consumers_multi(runtimes, watch, health_timeout, host_healthy).await;
+    let consumers = mount_recover::recover_consumers_for_owner(
+        RECOVER_OWNER,
+        runtimes,
+        watch,
+        health_timeout,
+        host_healthy,
+    )
+    .await;
     result.consumers = Some(consumers);
     Ok(result)
 }
 
+/// Owner tag the shared consumer sweep records for consumers nfs heals.
+const RECOVER_OWNER: &str = "nfs";
+
 /// Is the host mount covering `source` healthy? Finds the longest mountpoint
 /// that is a prefix of `source` (the mount the bind actually resolves through)
-/// and returns whether its last health probe was `ok`. An uncovered or
-/// non-`ok` source is treated as unhealthy so the consumer sweep's guard errs
-/// toward *not* restarting during any doubt.
-fn host_source_healthy(source: &str, mounts: &[Mount]) -> bool {
+/// and returns whether its last health probe was `ok`. A source no nfs mount
+/// covers is `None`: another backend owns it, and reporting it unhealthy would
+/// make the shared sweep skip consumers that backend is responsible for.
+fn host_source_healthy(source: &str, mounts: &[Mount]) -> Option<bool> {
     mounts
         .iter()
         .filter(|m| path_under_watch(source, std::slice::from_ref(&m.mountpoint)))
         .max_by_key(|m| m.mountpoint.len())
         .map(|m| m.health.as_deref() == Some("ok"))
-        .unwrap_or(false)
 }
 
 /// Does a host path fall under one of the watched prefixes? Shares prefix
@@ -844,11 +855,19 @@ fn path_under_watch(path: &str, watch: &[String]) -> bool {
     if watch.is_empty() {
         return true;
     }
-    watch.iter().any(|w| match path.strip_prefix(w.as_str()) {
+    watch.iter().any(|w| {
+        // "/" trims to "" and covers everything; "/mnt/x/" must match like "/mnt/x".
+        let w = w.trim_end_matches('/');
+        w.is_empty() || matches_prefix(path, w)
+    })
+}
+
+fn matches_prefix(path: &str, w: &str) -> bool {
+    match path.strip_prefix(w) {
         Some("") => true,
         Some(rest) => rest.starts_with('/'),
         None => false,
-    })
+    }
 }
 
 // ── nfs option grammar ──────────────────────────────────────────────────────
@@ -1810,7 +1829,23 @@ new:/export /mnt/x nfs4 rw 0 0
     }
 
     #[test]
-    fn host_source_healthy_uses_longest_covering_mount() {
+    fn path_under_watch_root_and_trailing_slash() {
+        let root = vec!["/".to_string()];
+        assert!(path_under_watch("/", &root));
+        assert!(path_under_watch("/mnt/pool/x", &root));
+        let trailing = vec!["/mnt/pool/".to_string()];
+        assert!(path_under_watch("/mnt/pool", &trailing));
+        assert!(path_under_watch("/mnt/pool/x", &trailing));
+        assert!(!path_under_watch("/mnt/poolx", &trailing));
+    }
+
+    #[test]
+    fn recover_owner_is_nfs() {
+        assert_eq!(RECOVER_OWNER, "nfs");
+    }
+
+    #[test]
+    fn host_source_healthy_is_tristate_by_ownership() {
         let mounts = vec![
             Mount {
                 device: "srv:/pool".into(),
@@ -1828,11 +1863,18 @@ new:/export /mnt/x nfs4 rw 0 0
             },
         ];
         // Longest covering mount for this source is /mnt/pool/data (stale).
-        assert!(!host_source_healthy("/mnt/pool/data/media", &mounts));
+        assert_eq!(
+            host_source_healthy("/mnt/pool/data/media", &mounts),
+            Some(false)
+        );
         // Covered only by /mnt/pool (ok).
-        assert!(host_source_healthy("/mnt/pool/downloads", &mounts));
-        // Uncovered → treated as unhealthy (guard errs toward not restarting).
-        assert!(!host_source_healthy("/srv/elsewhere", &mounts));
+        assert_eq!(
+            host_source_healthy("/mnt/pool/downloads", &mounts),
+            Some(true)
+        );
+        // Not an nfs mount: another backend owns it, so no verdict.
+        assert_eq!(host_source_healthy("/srv/elsewhere", &mounts), None);
+        assert_eq!(host_source_healthy("/mnt/poolx/data", &mounts), None);
     }
 
     #[test]
