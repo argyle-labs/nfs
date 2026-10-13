@@ -1,7 +1,7 @@
 # ci.yml for a Rust-only plugin: copy to .github/workflows/ci.yml. Each job is
-# a shared piece from argyle-labs/.github; add no steps here. A crate over the
-# default runners' memory cap passes `runs-on: ci-large` (and optionally
-# `build-jobs` / `debuginfo`) to every piece.
+# one shared job action from argyle-labs/.github; add no steps here. A crate
+# over the default runners' memory cap sets `runs-on: ci-large` (and optionally
+# `build-jobs` / `debuginfo`) on every Rust job.
 name: CI
 
 on:
@@ -20,15 +20,62 @@ concurrency:
 
 jobs:
   build:
-    uses: argyle-labs/.github/.github/workflows/rust-build.yml@feat/reusable-plugin-ci
-    secrets: inherit
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Build
+        uses: argyle-labs/.github/.github/actions/job-rust-build@feat/reusable-plugin-ci
+        with:
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+
   test:
     needs: build
-    uses: argyle-labs/.github/.github/workflows/rust-test.yml@feat/reusable-plugin-ci
-    secrets: inherit
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Test
+        uses: argyle-labs/.github/.github/actions/job-rust-test@feat/reusable-plugin-ci
+        with:
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+
   lint:
-    uses: argyle-labs/.github/.github/workflows/rust-lint.yml@feat/reusable-plugin-ci
-    secrets: inherit
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Lint
+        uses: argyle-labs/.github/.github/actions/job-rust-lint@feat/reusable-plugin-ci
+        with:
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
+
   lint-doctest:
-    uses: argyle-labs/.github/.github/workflows/rust-doctest.yml@feat/reusable-plugin-ci
-    secrets: inherit
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.CI_REGISTRY || 'gitea.scottkey.me' }}/argyle-labs/ci-rust:1.95.0
+      credentials:
+        username: ${{ secrets.CI_REGISTRY_USER }}
+        password: ${{ secrets.CI_REGISTRY_TOKEN }}
+    steps:
+      - name: Doctests
+        uses: argyle-labs/.github/.github/actions/job-rust-doctest@feat/reusable-plugin-ci
+        with:
+          sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
+          sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
+          sccache-secret-key: ${{ secrets.SCCACHE_S3_SECRET_KEY }}
