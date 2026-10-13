@@ -28,7 +28,7 @@ jobs:
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
     steps:
       - name: Build
-        uses: argyle-labs/.github/.github/actions/job-rust-build@feat/reusable-plugin-ci
+        uses: argyle-labs/.github/.github/actions/job-rust-build@main
         with:
           sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
           sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
@@ -44,7 +44,7 @@ jobs:
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
     steps:
       - name: Test
-        uses: argyle-labs/.github/.github/actions/job-rust-test@feat/reusable-plugin-ci
+        uses: argyle-labs/.github/.github/actions/job-rust-test@main
         with:
           sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
           sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
@@ -59,7 +59,7 @@ jobs:
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
     steps:
       - name: Lint
-        uses: argyle-labs/.github/.github/actions/job-rust-lint@feat/reusable-plugin-ci
+        uses: argyle-labs/.github/.github/actions/job-rust-lint@main
         with:
           sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
           sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
@@ -74,7 +74,7 @@ jobs:
         password: ${{ secrets.CI_REGISTRY_TOKEN }}
     steps:
       - name: Doctests
-        uses: argyle-labs/.github/.github/actions/job-rust-doctest@feat/reusable-plugin-ci
+        uses: argyle-labs/.github/.github/actions/job-rust-doctest@main
         with:
           sccache-endpoint: ${{ vars.SCCACHE_ENDPOINT }}
           sccache-access-key: ${{ secrets.SCCACHE_S3_ACCESS_KEY }}
