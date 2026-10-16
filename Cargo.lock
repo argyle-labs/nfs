@@ -1527,7 +1527,7 @@ dependencies = [
 name = "nfs"
 version = "0.1.0"
 dependencies = [
- "plugin-toolkit",
+ "orca-plugin-toolkit",
  "tempfile",
  "tokio",
 ]
@@ -1679,8 +1679,8 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orca-containers"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "clap",
@@ -1699,8 +1699,8 @@ dependencies = [
 
 [[package]]
 name = "orca-contract"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1717,8 +1717,8 @@ dependencies = [
 
 [[package]]
 name = "orca-db"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1745,8 +1745,8 @@ dependencies = [
 
 [[package]]
 name = "orca-deploy-target"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "async-trait",
  "orca-plugin-abi",
@@ -1759,8 +1759,8 @@ dependencies = [
 
 [[package]]
 name = "orca-derive"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1769,8 +1769,8 @@ dependencies = [
 
 [[package]]
 name = "orca-dispatch"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "clap",
@@ -1783,12 +1783,13 @@ dependencies = [
  "serde_path_to_error",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "orca-graphql"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "graphql-parser",
@@ -1803,8 +1804,8 @@ dependencies = [
 
 [[package]]
 name = "orca-macro-runtime"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1824,8 +1825,8 @@ dependencies = [
 
 [[package]]
 name = "orca-media"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "orca-derive",
  "schemars",
@@ -1837,8 +1838,8 @@ dependencies = [
 
 [[package]]
 name = "orca-notifications"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "clap",
@@ -1859,8 +1860,8 @@ dependencies = [
 
 [[package]]
 name = "orca-openapi"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -1875,7 +1876,7 @@ dependencies = [
 [[package]]
 name = "orca-plugin-abi"
 version = "0.1.0"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "schemars",
  "serde",
@@ -1883,8 +1884,8 @@ dependencies = [
 
 [[package]]
 name = "orca-plugin-proto"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "serde",
  "serde_json",
@@ -1893,8 +1894,8 @@ dependencies = [
 
 [[package]]
 name = "orca-plugin-toolkit"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1937,8 +1938,8 @@ dependencies = [
 
 [[package]]
 name = "orca-service"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "orca-contract",
  "orca-deploy-target",
@@ -1954,8 +1955,8 @@ dependencies = [
 
 [[package]]
 name = "orca-storage"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "orca-derive",
  "schemars",
@@ -1967,8 +1968,8 @@ dependencies = [
 
 [[package]]
 name = "orca-utils"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
+version = "0.2.1-rc.19"
+source = "git+https://github.com/argyle-labs/orca?branch=main#7cb801dcff4743153bc7f4fdfca1478a66f0b332"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2073,14 +2074,6 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "plugin-toolkit"
-version = "0.2.1-rc.14"
-source = "git+https://github.com/argyle-labs/orca?branch=main#13957d44db3cd667f5e3f0601c26c283684b9cfe"
-dependencies = [
- "orca-plugin-toolkit",
-]
 
 [[package]]
 name = "portable-atomic"
